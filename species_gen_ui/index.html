@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Species Generator</title>
+    <!-- QWebChannel is provided by QtWebEngine natively at this special URL -->
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+    <link rel="stylesheet" href="app.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Sidebar Navigation -->
+        <nav class="sidebar">
+            <div class="sidebar-header">
+                <h2>Species Gen</h2>
+            </div>
+            
+            <div class="project-settings">
+                <label>Mod Project Name</label>
+                <input type="text" id="mod-name" placeholder="e.g. MyDinoPack">
+            </div>
+
+            <div class="roster-header">
+                <h3>Species Roster</h3>
+                <button id="btn-add-species" class="btn-icon" title="Add Species">➕</button>
+            </div>
+            
+            <ul id="species-roster" class="roster-list">
+                <!-- Populated dynamically -->
+            </ul>
+
+            <ul class="nav-links mt-10">
+                <li class="nav-item active" data-page="page-species">Species Setup</li>
+                <li class="nav-item" data-page="page-data">Data Overrides</li>
+                <li class="nav-item" data-page="page-prefab">Prefab Builder</li>
+                <li class="nav-item" data-page="page-cosmetics">Cosmetics</li>
+                <li class="nav-item" data-page="page-assets">Assets & Scaling</li>
+                <li class="nav-item" data-page="page-editor">Edit Built Mod</li>
+                <li class="nav-item" data-page="page-expeditions">Expeditions</li>
+                <li class="nav-item" data-page="page-build">Review & Build</li>
+                <li class="nav-item" data-page="page-logs">Activity Logs</li>
+            </ul>
+            <div class="sidebar-footer">
+                <button id="btn-save-project" class="btn btn-secondary">Save Project</button>
+                <button id="btn-load-project" class="btn btn-secondary">Load Project</button>
+            </div>
+        </nav>
+
+        <!-- Main Content Area -->
+        <main class="content">
+            <!-- Page 1: Species -->
+            <section id="page-species" class="page active">
+                <header>
+                    <h1>Species Setup</h1>
+                    <p>Select a donor species and name your new clone.</p>
+                </header>
+                
+                <div class="card">
+                    <div class="form-group">
+                        <label for="donor-search">Donor Species</label>
+                        <input type="text" id="donor-search" placeholder="Search species... (e.g. Triceratops)" autocomplete="off">
+                        <ul id="donor-dropdown" class="dropdown" style="display: none;"></ul>
+                    </div>
+                    
+                    <div id="donor-info" class="info-box" style="display: none;">
+                        <p><strong>Selected Donor:</strong> <span id="lbl-donor-name">-</span></p>
+                        <p><strong>Family Members:</strong> <span id="lbl-donor-family-count">-</span></p>
+                    </div>
+                </div>
+
+                <div class="card" id="new-species-card" style="opacity: 0.5; pointer-events: none;">
+                    <div class="form-group">
+                        <label for="new-name">New Species Name</label>
+                        <input type="text" id="new-name" placeholder="e.g. Torosaurus">
+                    </div>
+                    
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="new-species-id">SpeciesID (Optional)</label>
+                            <input type="number" id="new-species-id" placeholder="Auto-assign (>900)">
+                        </div>
+                        <div class="form-group">
+                            <label for="new-genetic-id">GeneticSpeciesID (Optional)</label>
+                            <input type="number" id="new-genetic-id" placeholder="Auto-assign (>900)">
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="tech-tree-icon">Tech Tree Icon Name (Optional)</label>
+                        <input type="text" id="tech-tree-icon" placeholder="Defaults to New Species Name">
+                    </div>
+                </div>
+
+                <div class="card" id="family-preview-card" style="display: none;">
+                    <h3>Family Preview</h3>
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Age/Sex</th>
+                                <th>Donor Name</th>
+                                <th>New Name</th>
+                                <th>Prefab</th>
+                            </tr>
+                        </thead>
+                        <tbody id="family-preview-body">
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Page 2: Data -->
+            <section id="page-data" class="page">
+                <header>
+                    <h1>Data Cloning</h1>
+                    <p>Select which tables to clone and specify overrides for the current species.</p>
+                </header>
+                
+                <div class="two-pane">
+                    <div class="pane-left card">
+                        <h3>Tables</h3>
+                        <div class="table-list-controls">
+                            <button id="btn-select-all-tables" class="btn btn-small">Select All</button>
+                            <button id="btn-select-none-tables" class="btn btn-small">Select None</button>
+                        </div>
+                        <ul id="table-list" class="checklist">
+                            <li class="placeholder">Select a donor species first...</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="pane-right card">
+                        <h3>Overrides</h3>
+                        <p class="help-text">Set a specific value for all cloned rows in a table (e.g. SpeciesStats.MaxHealth = 1500).</p>
+                        
+                        <div id="overrides-list"></div>
+                        
+                        <button id="btn-add-override" class="btn btn-secondary mt-10">+ Add Override</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Page 3: Prefab Builder -->
+            <section id="page-prefab" class="page">
+                <header class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <h1>Prefab Builder</h1>
+                        <p>Configure prefabs and inherit properties for each family member.</p>
+                    </div>
+                    <div>
+                        <button id="btn-rebuild-prefab-index" class="btn btn-warning btn-small mr-2" style="background: #2b4c7e; color: #60c0ff; border: 1px solid #40a0ff;">⚡ Rebuild Prefab Index from Lua Dump</button>
+                        <button id="btn-load-mod-prefabs" class="btn btn-primary btn-small mr-2">Load Existing Mod Prefabs</button>
+                        <button id="btn-load-donor-prefabs" class="btn btn-secondary btn-small">Load Base Game Donor Prefabs</button>
+                    </div>
+
+                </header>
+
+                
+                <div class="tabs" id="prefab-tabs"></div>
+                
+                <div class="tab-content card" id="prefab-tab-content">
+                    <div class="placeholder">Select a donor species first...</div>
+                </div>
+            </section>
+
+
+            <!-- Page 4: Cosmetics -->
+            <section id="page-cosmetics" class="page">
+                <header>
+                    <h1>Cosmetics (_01 Variants)</h1>
+                    <p>Configure cosmetic variants for your species.</p>
+                </header>
+                
+                <div class="card">
+                    <div class="form-group checkbox-group">
+                        <input type="checkbox" id="chk-generate-cosmetics" checked>
+                        <label for="chk-generate-cosmetics">Generate cosmetic variant stubs</label>
+                    </div>
+                    
+                    <div class="form-group" id="cosmetic-count-group">
+                        <label for="num-cosmetics">Variants per family member:</label>
+                        <input type="number" id="num-cosmetics" min="1" max="10" value="1" style="width: 80px;">
+                    </div>
+                </div>
+                
+                <div id="cosmetic-previews"></div>
+            </section>
+
+            <!-- Page 5: Assets & Scaling -->
+            <section id="page-assets" class="page">
+                <header>
+                    <h1>Assets &amp; Scaling</h1>
+                    <p>Where your OVLs live, and optional render scaling.</p>
+                </header>
+
+                <div class="card">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <h3 class="mb-0">Asset Packages</h3>
+                        <button class="btn btn-sm btn-outline-info" id="btn-refresh-asset-paths">↻ Refresh Verification</button>
+                    </div>
+                    <p class="hint">
+                        A prefab's <code>AssetPackages</code> names must each resolve to an
+                        <code>&lt;name&gt;.assetpkg</code> in <code>Init/</code>, or the model
+                        silently fails to load. One is generated per family member.
+                    </p>
+
+                    <div class="form-row gap-2 align-items-end mb-3" style="display: flex; gap: 12px; align-items: flex-end;">
+                        <div class="form-group flex-1 mb-0" style="flex: 1;">
+                            <label for="asset-category">Category folder:</label>
+                            <select id="asset-category" class="form-control">
+                                <option value="">-- Select Category --</option>
+                                <option value="Land">Land</option>
+                                <option value="Water">Water</option>
+                                <option value="Air">Air</option>
+                                <option value="Shared">Shared</option>
+                            </select>
+
+                        </div>
+                        <button id="btn-add-category-assetpkgs" class="btn btn-primary mb-0" style="padding: 8px 16px;">+ Add Category Asset Packages</button>
+                    </div>
+
+
+                    <p class="hint">Resulting path:</p>
+                    <pre id="asset-path-preview" class="code-preview">—</pre>
+
+                    <p class="hint">
+                        <strong>These paths are conventional guesses.</strong> They must match where
+                        the OVL is actually installed. Edit any of them below.
+                    </p>
+                    <div class="border-top pt-3 mt-3">
+                        <h5>+ Add Custom AssetPackage</h5>
+                        <p class="hint">
+                            Create custom model/audio/texture <code>.assetpkg</code> files in <code>Init/</code> and automatically generate their target folders inside your mod directory.
+                        </p>
+                        <div class="form-row gap-2 align-items-end">
+                            <div class="form-group flex-1 mb-0">
+                                <label for="txt-custom-ap-name">Package Name:</label>
+                                <input type="text" id="txt-custom-ap-name" placeholder="e.g. KaiCenat or MetrosaurusAudio">
+                            </div>
+                            <div class="form-group flex-2 mb-0">
+                                <label for="txt-custom-ap-path">Asset Path in OVL:</label>
+                                <input type="text" id="txt-custom-ap-path" placeholder="e.g. ovldata\Metrosaurus\KaiCenat\KaiCenat_Female">
+                            </div>
+                            <button id="btn-add-custom-assetpkg" class="btn btn-small btn-outline-success mb-0">+ Add Custom AssetPackage</button>
+                        </div>
+                    </div>
+
+
+                    <div id="asset-package-rows" class="mt-3"></div>
+                </div>
+
+
+
+                <!-- Icons -->
+                <div class="card mb-3">
+                  <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0">Icons</h5>
+                    <div>
+                        <button class="btn btn-sm btn-outline-info" id="btn-refresh-icon-paths">↻ Refresh Verification</button>
+                        <button class="btn btn-sm btn-outline-success" id="btn-add-icon">+ Add Icon</button>
+                        <button class="btn btn-sm btn-primary" id="btn-save-icons-direct">Update Built Mod Icons</button>
+                    </div>
+
+                  </div>
+
+                  <div class="card-body">
+                    <p class="text-muted small">Specify custom UI icons (will generate userinterfaceimages.ppuipkg files and matching Init/.assetpkg files).</p>
+                    <div id="icon-list" class="list-group">
+                      <!-- JS will populate this -->
+                    </div>
+                  </div>
+                </div>
+
+
+                <div class="card">
+                    <h3>Render Scaling (optional)</h3>
+                    <div class="form-group checkbox-group">
+                        <input type="checkbox" id="chk-scaling">
+                        <label for="chk-scaling">Enable render scaling for this species</label>
+                    </div>
+                    <div class="form-group" id="scale-value-group" style="display:none;">
+                        <label>Family Unit Member Scale Multipliers:</label>
+                        <p class="hint">Set custom render scale multipliers for each member of the species family unit.</p>
+                        <div id="family-scales-inputs" class="form-row gap-2 mt-2"></div>
+                    </div>
+                    <p class="hint mt-2">
+                        Hooks <code>DinosaurUtils.InstantiateDinosaur</code> and calls
+                        <code>SetScale</code>. <strong>Collision and pathing are NOT verified to
+                        follow the visual scale</strong> — roughly 0.5–0.6 is known good, larger
+                        values are lightly tested.
+                    </p>
+
+                </div>
+            </section>
+
+            <!-- Page 6: Edit Built Mod (cosmetics sub-pages) -->
+            <section id="page-editor" class="page">
+                <header>
+                    <h1>Edit Built Mod</h1>
+                    <p>Tune cosmetics in an already-generated mod, without opening the FDB.</p>
+                </header>
+
+                <div class="card">
+                    <div class="form-group">
+                        <label for="editor-mod">Generated mod:</label>
+                        <select id="editor-mod"></select>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Cosmetics Quick Edit:</label>
+                        <div class="btn-group gap-2">
+                            <button id="btn-jump-sets" class="btn btn-secondary btn-small">Edit Cosmetic Sets</button>
+                            <button id="btn-jump-variants" class="btn btn-secondary btn-small">Edit Variants</button>
+                            <button id="btn-jump-patterns" class="btn btn-secondary btn-small">Edit Patterns</button>
+                        </div>
+                    </div>
+
+                    <div class="form-group mt-10">
+                        <label for="editor-table">Select Table:</label>
+                        <select id="editor-table">
+                            <optgroup label="Cosmetics">
+                                <option value="SpeciesCosmeticSets">SpeciesCosmeticSets</option>
+                                <option value="SpeciesCosmeticVariants">SpeciesCosmeticVariants</option>
+                                <option value="SpeciesCosmeticPatterns">SpeciesCosmeticPatterns</option>
+                            </optgroup>
+                            <optgroup label="Dinosaur Data">
+                                <option value="Species">Species</option>
+                                <option value="SpeciesStats">SpeciesStats</option>
+                                <option value="SpeciesNeeds">SpeciesNeeds</option>
+                                <option value="Simulation">Simulation</option>
+                                <option value="SpeciesCombat">SpeciesCombat</option>
+                            </optgroup>
+                        </select>
+                    </div>
+                    <div class="mt-10">
+                        <button id="btn-editor-load" class="btn">Load Table</button>
+                        <button id="btn-editor-addrow" class="btn">Add Row</button>
+                        <button id="btn-editor-save" class="btn btn-primary">Save Changes</button>
+                    </div>
+                    <p class="hint">
+                        Saving replaces the table in one transaction — a UNIQUE clash rolls the
+                        whole edit back rather than leaving the mod half-written.
+                    </p>
+                </div>
+
+                <div class="card" id="editor-problems-card" style="display:none;">
+                    <h3>Consistency</h3>
+                    <ul id="editor-problems"></ul>
+                </div>
+
+                <div class="card">
+                    <div id="editor-grid" style="overflow:auto; max-height:52vh;"></div>
+                </div>
+            </section>
+
+            <!-- Page 7: Expeditions / dig sites -->
+            <section id="page-expeditions" class="page">
+                <header>
+                    <h1>Expeditions</h1>
+                    <p>Add dig sites to a generated mod, or edit expedition tables.</p>
+                </header>
+
+                <div class="card">
+                    <div class="form-group">
+                        <label for="exp-mod">Generated mod:</label>
+                        <select id="exp-mod"></select>
+                    </div>
+
+                    <div class="form-group"><label for="exp-siteid">Site ID (unique):</label>
+                        <input type="text" id="exp-siteid" placeholder="MyModDigSite01"></div>
+                    <div class="form-group"><label for="exp-locid">Location ID (unique, &ge; 0):</label>
+                        <input type="number" id="exp-locid" min="0" value="9000"></div>
+                    <div class="form-group"><label for="exp-territory">Territory:</label>
+                        <input type="text" id="exp-territory"></div>
+                    <div class="form-group"><label for="exp-country">Country loc string:</label>
+                        <input type="text" id="exp-country"></div>
+                    <div class="form-group"><label for="exp-location">Location loc string:</label>
+                        <input type="text" id="exp-location"></div>
+                    <div class="form-group"><label for="exp-lat">Latitude:</label>
+                        <input type="number" step="0.0001" id="exp-lat" value="0"></div>
+                    <div class="form-group"><label for="exp-long">Longitude:</label>
+                        <input type="number" step="0.0001" id="exp-long" value="0"></div>
+
+                    <div class="form-group checkbox-group">
+                        <input type="checkbox" id="exp-capture">
+                        <label for="exp-capture">Capture site</label>
+                    </div>
+                    <div class="form-group checkbox-group">
+                        <input type="checkbox" id="exp-marine">
+                        <label for="exp-marine">Marine location (capture sites only)</label>
+                    </div>
+
+                    <div id="exp-yield-group">
+                        <div class="form-group"><label for="exp-normal">Normal fossil yield:</label>
+                            <input type="text" id="exp-normal" value="DNAFossils"></div>
+                        <div class="form-group"><label for="exp-junk">Junk fossil yield:</label>
+                            <input type="text" id="exp-junk" value="MiscFossils"></div>
+                    </div>
+
+                    <div class="form-group checkbox-group">
+                        <input type="checkbox" id="exp-mirror" checked>
+                        <label for="exp-mirror">Also add to Rebirth / Challenge tables</label>
+                    </div>
+                    <p class="hint">
+                        Leave this ticked unless you know otherwise — a site added only to
+                        <code>DigSites</code> will not exist in Rebirth or Challenge modes.
+                    </p>
+
+                    <button id="btn-exp-add" class="btn btn-primary">Add Dig Site</button>
+                    <pre id="exp-result" class="code-preview">—</pre>
+                </div>
+
+                <div class="card">
+                    <h3>Existing dig sites in this mod</h3>
+                    <div id="exp-list" style="overflow:auto; max-height:30vh;"></div>
+                    <ul id="exp-problems" style="margin-top:0.5rem; color:#d32f2f;"></ul>
+                </div>
+                
+                <div class="card mt-3">
+                    <h3>Expeditions Table Editor</h3>
+                    <p class="text-muted">Directly edit rows for expedition tables.</p>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="exp-table-select">Select Table</label>
+                            <select id="exp-table-select">
+                                <option value="Genomes">Genomes</option>
+                                <option value="Fossils">Fossils</option>
+                                <option value="DigSites">DigSites</option>
+                                <option value="DigSiteFossils">DigSiteFossils</option>
+                                <option value="Tasks">Tasks</option>
+                            </select>
+                        </div>
+                    </div>
+                    <button id="btn-exp-editor-load" class="btn">Load Table</button>
+                    <button id="btn-exp-editor-addrow" class="btn">Add Row</button>
+                    <button id="btn-exp-editor-save" class="btn btn-primary">Save Changes</button>
+                    
+                    <div id="exp-editor-grid" style="margin-top: 1rem; overflow:auto; max-height:52vh;"></div>
+                </div>
+            </section>
+
+            <!-- Page 8: Build -->
+            <section id="page-build" class="page">
+                <header>
+                    <h1>Review & Build</h1>
+                    <p>Review warnings and generate the mod project.</p>
+                </header>
+                
+                <div class="card warnings-card" id="build-warnings-card" style="display: none;">
+                    <h3 class="text-amber">⚠️ Warnings</h3>
+                    <ul id="build-warnings-list" class="warning-list"></ul>
+                </div>
+                
+                <div class="card">
+                    <div class="form-group checkbox-group">
+                        <input type="checkbox" id="chk-no-scaffold">
+                        <label for="chk-no-scaffold">Data Only (No scaffold Luas/ACSE)</label>
+                    </div>
+                    <div class="form-group checkbox-group">
+                        <input type="checkbox" id="chk-no-prefab-check">
+                        <label for="chk-no-prefab-check">Skip prefab validation (faster)</label>
+                    </div>
+                    
+                    <div class="d-flex gap-2 mt-10">
+                        <button id="btn-generate" class="btn btn-primary btn-large">Generate Mod Project</button>
+                        <button id="btn-update-existing" class="btn btn-secondary btn-large">Update Existing Mod Files</button>
+                    </div>
+                </div>
+
+                
+                <div class="card" id="build-results-card" style="display: none;">
+                    <h3>Build Results</h3>
+                    <div id="build-results-content" class="code-block"></div>
+                </div>
+            </section>
+
+            <!-- Page 9: Activity Logs -->
+            <section id="page-logs" class="page">
+                <header>
+                    <h1>Activity &amp; Debug Logs</h1>
+                    <p>Live tracking of user actions, API events, database edits, and system errors.</p>
+                </header>
+
+                <div class="card">
+                    <div class="form-row gap-3 align-items-center flex-wrap" style="display: flex; flex-direction: row; align-items: center; flex-wrap: wrap;">
+                        <div class="form-group mb-0" style="margin-right: 15px; display: flex; align-items: center;">
+                            <label for="sel-logs-session" class="small" style="margin-right: 8px; white-space: nowrap;">Session:</label>
+                            <select id="sel-logs-session" style="width: auto; padding: 4px 8px;">
+                                <option value="">Loading sessions...</option>
+                            </select>
+                        </div>
+                        <div class="form-group mb-0" style="margin-right: 15px; display: flex; align-items: center;">
+                            <label for="sel-logs-level" class="small" style="margin-right: 8px; white-space: nowrap;">Level:</label>
+                            <select id="sel-logs-level" style="width: auto; padding: 4px 8px;">
+                                <option value="">All Levels</option>
+                                <option value="INFO">INFO</option>
+                                <option value="WARNING">WARNING</option>
+                                <option value="ERROR">ERROR</option>
+                                <option value="JS">JS (Console)</option>
+                            </select>
+                        </div>
+                        <div class="form-group mb-0" style="margin-right: 15px; display: flex; align-items: center;">
+                            <label for="sel-logs-limit" class="small" style="margin-right: 8px; white-space: nowrap;">Limit:</label>
+                            <select id="sel-logs-limit" style="width: auto; padding: 4px 8px;">
+                                <option value="50">50 lines</option>
+                                <option value="100" selected>100 lines</option>
+                                <option value="200">200 lines</option>
+                                <option value="500">500 lines</option>
+                            </select>
+                        </div>
+
+                        <div class="btn-group gap-2" style="margin-left: auto; display: flex; gap: 8px;">
+                            <button id="btn-logs-refresh" class="btn btn-primary btn-small">Refresh</button>
+                            <button id="btn-logs-clear" class="btn btn-secondary btn-small">Clear Logs</button>
+                            <button id="btn-logs-copy" class="btn btn-secondary btn-small">Copy to Clipboard</button>
+                        </div>
+                    </div>
+                    <div class="d-flex justify-content-between align-items-center mt-10" style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px;">
+                        <p class="hint mb-0" style="margin: 0;">Log File Location: <span id="lbl-log-path" class="text-green">Loading...</span></p>
+                        <span id="lbl-log-summary" class="small text-muted" style="font-size: 0.85rem; opacity: 0.8;">Showing 0 of 0 entries</span>
+                    </div>
+                </div>
+
+
+                <div class="card">
+                    <pre id="log-console-box" class="code-preview" style="max-height: 60vh; overflow-y: auto; font-family: monospace; white-space: pre-wrap; word-break: break-all; background: #0a0e14; color: #a9b7c6; padding: 12px; border-radius: 6px;">Loading activity logs...</pre>
+                </div>
+            </section>
+
+        </main>
+    </div>
+
+    <!-- Templates -->
+    <template id="tpl-override-row">
+        <div class="override-row">
+            <input type="text" class="ov-table" placeholder="Table (e.g. SpeciesStats)">
+            <span class="dot">.</span>
+            <input type="text" class="ov-column" placeholder="Column">
+            <span class="equals">=</span>
+            <input type="text" class="ov-value" placeholder="Value">
+            <button class="btn-icon btn-remove-override">✕</button>
+        </div>
+    </template>
+
+    <template id="tpl-property-row">
+        <div class="property-row">
+            <input type="checkbox" class="prop-enable" checked>
+            <label class="prop-name"></label>
+            <input type="text" class="prop-val">
+        </div>
+    </template>
+
+    <template id="tpl-prefab-tab-panel">
+        <div class="prefab-panel">
+            <div class="form-row gap-3 mb-3" style="display: flex; gap: 12px; align-items: flex-end; margin-bottom: 12px;">
+                <div class="form-group search-container flex-2 mb-0" style="position: relative; flex: 2;">
+                    <label class="small text-muted" style="display: block; margin-bottom: 4px; font-weight: bold;">Inherit From (Parent Prefab):</label>
+                    <input type="text" class="prefab-parent-input form-control" placeholder="Search parent prefab... (e.g. Triceratops)" autocomplete="off" style="width: 100%; padding: 8px 12px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.2); color: #fff;">
+                    <ul class="search-dropdown dropdown-menu" style="display: none; position: absolute; z-index: 1000; left: 0; right: 0; max-height: 200px; overflow-y: auto; background: #1e2430; border: 1px solid rgba(255,255,255,0.15); list-style: none; margin: 0; padding: 0;"></ul>
+                </div>
+                <div class="form-group flex-1 mb-0" style="flex: 1;">
+                    <label class="small text-muted" style="display: block; margin-bottom: 4px; font-weight: bold;">Render Scale Multiplier:</label>
+                    <input type="number" step="0.05" min="0.1" max="10.0" class="prefab-scale-input form-control" placeholder="1.0" value="1.0" style="width: 100%; padding: 8px 12px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.2); color: #fff;">
+                </div>
+            </div>
+            <div class="properties-list"></div>
+        </div>
+    </template>
+
+
+    <template id="tpl-icon-item">
+        <div class="icon-item card mb-2 p-2" style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.1); margin-bottom: 8px; padding: 8px; border-radius: 6px;">
+            <div class="form-row gap-2 align-items-center" style="display: flex; gap: 8px; align-items: center;">
+                <input type="text" class="icon-id form-control" placeholder="Icon ID" style="flex: 1; padding: 6px 10px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.2); color: #fff;">
+                <input type="text" class="icon-path form-control" placeholder="Image Path (uigameface/...)" style="flex: 2; padding: 6px 10px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.2); color: #fff;">
+                <input type="text" class="icon-pkg form-control" placeholder="Asset Package" style="flex: 1; padding: 6px 10px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.2); color: #fff;">
+                <span class="badge badge-secondary" style="padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; background: #4a5568; color: #fff;">Pending</span>
+                <button class="btn btn-small btn-secondary btn-remove-icon" style="padding: 4px 8px; cursor: pointer;">✕</button>
+            </div>
+        </div>
+    </template>
+
+    <template id="tpl-asset-package-item">
+        <div class="asset-package-item card mb-2 p-2" style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.1); margin-bottom: 8px; padding: 8px; border-radius: 6px;">
+            <div class="form-row gap-2 align-items-center" style="display: flex; gap: 8px; align-items: center;">
+                <input type="text" class="ap-name form-control" placeholder="Package Name" style="flex: 1; padding: 6px 10px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.2); color: #fff;">
+                <input type="text" class="ap-path form-control" placeholder="Asset Path" style="flex: 2; padding: 6px 10px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.2); color: #fff;">
+                <span class="badge badge-secondary" style="padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; background: #4a5568; color: #fff;">Pending</span>
+                <button class="btn btn-small btn-secondary btn-remove-ap" style="padding: 4px 8px; cursor: pointer;">✕</button>
+            </div>
+        </div>
+    </template>
+
+    <template id="tpl-asset-package-row">
+        <div class="asset-package-row" style="display: flex; gap: 8px; align-items: center; margin-bottom: 6px;">
+            <span class="drag-handle" style="cursor: move; opacity: 0.6;">≡</span>
+            <input type="text" class="ap-value form-control" placeholder="AssetPackage Name" style="flex: 1; padding: 6px 10px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.2); color: #fff;">
+            <button class="btn-icon btn-remove-ap" style="padding: 4px 8px; cursor: pointer;">✕</button>
+        </div>
+    </template>
+
+
+    <script src="js/roster.js"></script>
+    <script src="js/data_overrides.js"></script>
+    <script src="js/prefab_builder.js"></script>
+    <script src="js/assets_icons.js"></script>
+    <script src="js/cosmetics_expeditions.js"></script>
+    <script src="js/logs.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
+
+
