@@ -504,9 +504,10 @@ class PPUIPkgTool(QMainWindow):
 
     # ------------------------------------------------- search / selection ---
     def _focus_search(self):
-        self.tabs.setCurrentIndex(0)
-        self.txt_search.setFocus()
-        self.txt_search.selectAll()
+        """Ctrl+F focuses the search box of whichever tab is open."""
+        box = self.txt_icon_search if self.tabs.currentIndex() == 1 else self.txt_search
+        box.setFocus()
+        box.selectAll()
 
     def _on_search_changed(self, _text):
         self._refresh()
@@ -622,6 +623,24 @@ class PPUIPkgTool(QMainWindow):
 
         isplit = QSplitter(Qt.Horizontal)
 
+        isearch_row = QHBoxLayout()
+        self.txt_icon_search = QLineEdit()
+        self.txt_icon_search.setPlaceholderText(
+            "Search icons...  (matches image_name and asset_package; "
+            "space-separated terms must all match)")
+        self.txt_icon_search.setClearButtonEnabled(True)
+        self.txt_icon_search.textChanged.connect(self._on_icon_search_changed)
+        isearch_row.addWidget(self.txt_icon_search, 1)
+        b_iclear = QPushButton("Clear")
+        b_iclear.clicked.connect(self.txt_icon_search.clear)
+        isearch_row.addWidget(b_iclear)
+        lay.addLayout(isearch_row)
+
+        self.lbl_icon_filter = QLabel("")
+        self.lbl_icon_filter.setStyleSheet(f"color:{TEXT_MUTED};")
+        self.lbl_icon_filter.setVisible(False)
+        lay.addWidget(self.lbl_icon_filter)
+
         self.tbl_icons = QTableWidget(0, 3)
         self.tbl_icons.setHorizontalHeaderLabels(
             ["image_name", "asset_package", "art on disk"])
@@ -676,9 +695,32 @@ class PPUIPkgTool(QMainWindow):
         lay.addWidget(self.lbl_icon_status)
         return page
 
+    def matches_icon_filter(self, image_name, asset_package):
+        """All space-separated terms must appear in the path OR the package."""
+        box = getattr(self, "txt_icon_search", None)
+        terms = box.text().lower().split() if box else []
+        if not terms:
+            return True
+        haystack = f"{image_name} {asset_package}".lower()
+        return all(t in haystack for t in terms)
+
+    def _on_icon_search_changed(self, _text):
+        self._refresh()
+        if self.tbl_icons.rowCount():
+            self.tbl_icons.selectRow(0)
+        self.on_icon_row_selected()
+
+    def icon_index_at(self, row):
+        """Map a TABLE ROW to an index into self.icons (they differ when filtered)."""
+        if row < 0 or row >= self.tbl_icons.rowCount():
+            return -1
+        cell = self.tbl_icons.item(row, 0)
+        idx = cell.data(Qt.UserRole) if cell else None
+        return idx if idx is not None and idx < len(self.icons) else -1
+
     def on_icon_row_selected(self):
         """Load the selected reference's art off disk and describe it."""
-        row = self.tbl_icons.currentRow()
+        row = self.icon_index_at(self.tbl_icons.currentRow())
         if row < 0 or row >= len(self.icons):
             self.png_preview.message = "Select a reference to preview its art."
             self.png_preview.load_path(None)
@@ -897,11 +939,11 @@ class PPUIPkgTool(QMainWindow):
         if not hasattr(self, "tbl_icons"):
             return
 
-        self.tbl_icons.blockSignals(True)
+        # Status is computed for EVERY reference, not just the visible rows, so
+        # the summary underneath still counts what a filter is hiding.
+        status = {}
         missing = 0
-        for row, (img, _pkg) in enumerate(self.icons):
-            if row >= self.tbl_icons.rowCount():
-                break
+        for idx, (img, _pkg) in enumerate(self.icons):
             png, tex = find_image_pair(root, img) if root else (None, None)
 
             if png and tex:
@@ -927,7 +969,14 @@ class PPUIPkgTool(QMainWindow):
                 text = "missing"
                 colour = WARN
                 missing += 1
+            status[idx] = (text, colour)
 
+        self.tbl_icons.blockSignals(True)
+        for row in range(self.tbl_icons.rowCount()):
+            idx = self.icon_index_at(row)
+            if idx < 0:
+                continue
+            text, colour = status[idx]
             cell = QTableWidgetItem(text)
             cell.setForeground(QColor(colour))
             cell.setFlags(cell.flags() & ~Qt.ItemIsEditable)
@@ -1101,8 +1150,8 @@ class PPUIPkgTool(QMainWindow):
 
     def on_png_replace(self):
         """WAY 2 - swap art for an EXISTING reference. Reference unchanged."""
-        row = self.tbl_icons.currentRow()
-        if row < 0 or row >= len(self.icons):
+        row = self.icon_index_at(self.tbl_icons.currentRow())
+        if row < 0:
             QMessageBox.information(
                 self, "Replace PNG", "Select a reference row first.")
             return
@@ -1163,8 +1212,8 @@ class PPUIPkgTool(QMainWindow):
         self.lbl_status.setText(f"Replaced art for {image_name}.")
 
     def on_png_reveal(self):
-        row = self.tbl_icons.currentRow()
-        if row < 0 or row >= len(self.icons):
+        row = self.icon_index_at(self.tbl_icons.currentRow())
+        if row < 0:
             return
         image_name, _pkg = self.icons[row]
         png, tex = find_image_pair(self.image_root(), image_name)
@@ -1210,11 +1259,27 @@ class PPUIPkgTool(QMainWindow):
             self.lbl_filter.setVisible(False)
 
         self.tbl_icons.blockSignals(True)
-        self.tbl_icons.setRowCount(len(self.icons))
-        for row, (img, pkg) in enumerate(self.icons):
-            self.tbl_icons.setItem(row, 0, QTableWidgetItem(img))
+        visible = [(i, img, pkg) for i, (img, pkg) in enumerate(self.icons)
+                   if self.matches_icon_filter(img, pkg)]
+        self.tbl_icons.setRowCount(len(visible))
+        for row, (idx, img, pkg) in enumerate(visible):
+            cell = QTableWidgetItem(img)
+            # Same trap as the files list: with a filter on, the table row is
+            # NOT the index into self.icons. Every action reads this back.
+            cell.setData(Qt.UserRole, idx)
+            self.tbl_icons.setItem(row, 0, cell)
             self.tbl_icons.setItem(row, 1, QTableWidgetItem(pkg))
         self.tbl_icons.blockSignals(False)
+
+        if self.txt_icon_search and self.txt_icon_search.text().strip():
+            self.lbl_icon_filter.setText(
+                f"Showing {len(visible)} of {len(self.icons)} reference(s)."
+                + ("   No match - try fewer terms." if not visible else ""))
+            self.lbl_icon_filter.setStyleSheet(
+                f"color:{WARN if not visible else TEXT_MUTED};")
+            self.lbl_icon_filter.setVisible(True)
+        else:
+            self.lbl_icon_filter.setVisible(False)
 
         # Resolve every reference against the folders beside the package, so
         # missing art (and art nothing points at) is visible on load.
@@ -1240,10 +1305,11 @@ class PPUIPkgTool(QMainWindow):
         self.path = path
         self.dirty = False
         # Drop any stale filter, or a new package can open looking empty.
-        if self.txt_search:
-            self.txt_search.blockSignals(True)
-            self.txt_search.clear()
-            self.txt_search.blockSignals(False)
+        for box in (self.txt_search, self.txt_icon_search):
+            if box:
+                box.blockSignals(True)
+                box.clear()
+                box.blockSignals(False)
         self._refresh()
         self.lbl_status.setText(
             f"Loaded {len(self.files)} embedded file(s), {len(self.icons)} icon reference(s).")
@@ -1581,23 +1647,30 @@ class PPUIPkgTool(QMainWindow):
         self._mark_dirty()
 
     def on_icon_edited(self, item):
-        row, col = item.row(), item.column()
-        if row >= len(self.icons):
+        col = item.column()
+        idx = self.icon_index_at(item.row())
+        if idx < 0:
             return
-        img, pkg = self.icons[row]
-        self.icons[row] = (item.text(), pkg) if col == 0 else (img, item.text())
+        img, pkg = self.icons[idx]
+        self.icons[idx] = (item.text(), pkg) if col == 0 else (img, item.text())
         self.dirty = True
 
     def on_icon_add(self):
+        # A new row would usually be hidden by an active filter; clear it so the
+        # row the user just asked for is actually on screen.
+        if self.txt_icon_search and self.txt_icon_search.text().strip():
+            self.txt_icon_search.blockSignals(True)
+            self.txt_icon_search.clear()
+            self.txt_icon_search.blockSignals(False)
         self.icons.append(("uigameface/img/dinosaurspecies/small/dinosaurs_small_x.png",
                            "MyMod_Dinosaur_Small"))
         self._mark_dirty()
 
     def on_icon_delete(self):
-        row = self.tbl_icons.currentRow()
-        if row < 0 or row >= len(self.icons):
+        idx = self.icon_index_at(self.tbl_icons.currentRow())
+        if idx < 0:
             return
-        del self.icons[row]
+        del self.icons[idx]
         self._mark_dirty()
 
     def closeEvent(self, event):
