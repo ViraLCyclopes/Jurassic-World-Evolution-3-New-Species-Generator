@@ -84,6 +84,22 @@ def default_icon_name_for(sp_conf):
     return sp_conf.get("genome") or sp_conf.get("name") or ""
 
 
+def asset_package_gender_subdir(package_name):
+    """Return the generated family-member folder for an asset package.
+
+    Match a complete suffix, never a substring: ``female`` contains ``male``,
+    which previously sent every ``*_Female`` package into the Male folder.
+    Optional numeric suffixes cover family variants without misclassifying a
+    species whose own name happens to contain one of these words.
+    """
+    match = re.search(
+        r"_(female|male|juvenile)(?:_\d+)?$",
+        (package_name or "").lower())
+    if match:
+        return match.group(1).capitalize()
+    return "Female"
+
+
 def build_default_icon_set(out_dir, mod_name, plans, report):
     """Give every species a full placeholder icon set.
 
@@ -1064,12 +1080,7 @@ def write_scaffold(out_dir, mod_name, plans, config, report):
             if not base_sp_name:
                 base_sp_name = pkg.split('_')[0]
 
-            if pkg.lower().endswith("_male") or "male" in pkg.lower():
-                gender_sub = "Male"
-            elif pkg.lower().endswith("_juvenile") or "juvenile" in pkg.lower():
-                gender_sub = "Juvenile"
-            else:
-                gender_sub = "Female"
+            gender_sub = asset_package_gender_subdir(pkg)
 
             raw_path = f"ovldata\\{mod_name}\\Dinosaurs\\{category}\\{base_sp_name}\\{gender_sub}\\{pkg}"
 
