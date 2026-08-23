@@ -123,8 +123,17 @@ class SpeciesGenBackend(QObject):
             if not mod_name or not species_configs:
                 return json.dumps({"success": False, "error": "mod_name and at least one species are required"})
 
+            species_gen.allocate_species_ids(species_configs)
+
             plans = []
+
             combined_report = {"warnings": [], "tables": {}, "exp_tables": {}}
+
+            # GUI projects use an explicit per-species feature gate. Rebuild
+            # this map so stale scale data from an older saved project cannot
+            # silently turn scaling back on after the checkbox is cleared.
+            if any("scaling_enabled" in c for c in species_configs):
+                payload["scaling"] = {}
             
             root_ap = payload.get("asset_packages") or {}
             for config in species_configs:
@@ -134,13 +143,22 @@ class SpeciesGenBackend(QObject):
                 plan, report = species_gen.plan_species(config)
                 plans.append({"config": config, **plan})
 
-                if config.get("scaling"):
+                if config.get("scaling_enabled") is True and config.get("scaling"):
                     payload.setdefault("scaling", {}).update(config["scaling"])
 
                 if config.get("asset_packages"):
                     payload.setdefault("asset_packages", {}).update(config["asset_packages"])
                 if config.get("asset_category") and not payload.get("asset_category"):
                     payload["asset_category"] = config["asset_category"]
+                # asset_package_inheritance is resolved per family member inside
+                # write_scaffold, which reads the SPECIES config first and the
+                # payload only as the mod-wide default. A per-species value set
+                # in the UI is already on `config` (same object that goes into
+                # the plan), so it is honoured; only lift a bare mod-wide string
+                # up to the payload as the default when nothing is there yet.
+                if (isinstance(config.get("asset_package_inheritance"), str)
+                        and not payload.get("asset_package_inheritance")):
+                    payload["asset_package_inheritance"] = config["asset_package_inheritance"]
 
                 if report.get("warnings"):
                     combined_report["warnings"].extend(report["warnings"])
@@ -186,14 +204,27 @@ class SpeciesGenBackend(QObject):
         except Exception as e:
             return json.dumps({"success": False, "error": str(e)})
 
+    def _resolve_fdb_path(self, fdb_path):
+        if not fdb_path or fdb_path == "undefined" or fdb_path == "null":
+            return None
+        if not os.path.isabs(fdb_path):
+            fdb_path = os.path.join(species_gen.BASE_DIR, fdb_path)
+        if not os.path.isfile(fdb_path):
+            return None
+        return fdb_path
+
     @pyqtSlot(str, str, result=str)
     def load_mod_table(self, fdb_path, table):
         try:
+            real_path = self._resolve_fdb_path(fdb_path)
+            if not real_path:
+                return json.dumps({"success": False, "error": f"FDB file not found or path invalid: {fdb_path!r}"})
+
             if table in species_gen.COSMETIC_TABLES:
-                species_gen.ensure_table(fdb_path, table)
-            data = species_gen.read_table(fdb_path, table)
+                species_gen.ensure_table(real_path, table)
+            data = species_gen.read_table(real_path, table)
             if data is None:
-                return json.dumps({"success": False, "error": f"{table} not present in this mod"})
+                return json.dumps({"success": False, "error": f"Table '{table}' is not present in database '{os.path.basename(real_path)}'"})
             return json.dumps({"success": True, "data": data})
         except Exception as e:
             return json.dumps({"success": False, "error": str(e)})
@@ -201,22 +232,40 @@ class SpeciesGenBackend(QObject):
     @pyqtSlot(str, str, str, result=str)
     def save_mod_table(self, fdb_path, table, payload_json):
         try:
+            real_path = self._resolve_fdb_path(fdb_path)
+            if not real_path:
+                return json.dumps({"success": False, "error": f"FDB file not found or path invalid: {fdb_path!r}"})
+
             payload = json.loads(payload_json)
             report = {}
-            n = species_gen.write_table_rows(fdb_path, table, payload["columns"], payload["rows"], report)
+            n = species_gen.write_table_rows(real_path, table, payload["columns"], payload["rows"], report)
             problems = []
             if table in species_gen.COSMETIC_TABLES:
-                problems = species_gen.validate_cosmetics(fdb_path)
+                problems = species_gen.validate_cosmetics(real_path)
             return json.dumps({"success": True, "written": n, "problems": problems})
+        except Exception as e:
+            return json.dumps({"success": False, "error": str(e)})
+
+    @pyqtSlot(str, result=str)
+    def check_table_problems(self, fdb_path):
+        try:
+            real_path = self._resolve_fdb_path(fdb_path)
+            if not real_path:
+                return json.dumps({"success": True, "problems": []})
+            return json.dumps({"success": True, "problems": species_gen.validate_cosmetics(real_path)})
         except Exception as e:
             return json.dumps({"success": False, "error": str(e)})
 
     @pyqtSlot(str, result=str)
     def validate_mod_cosmetics(self, fdb_path):
         try:
-            return json.dumps({"success": True, "problems": species_gen.validate_cosmetics(fdb_path)})
+            real_path = self._resolve_fdb_path(fdb_path)
+            if not real_path:
+                return json.dumps({"success": True, "problems": []})
+            return json.dumps({"success": True, "problems": species_gen.validate_cosmetics(real_path)})
         except Exception as e:
             return json.dumps({"success": False, "error": str(e)})
+
 
     @pyqtSlot(str, str, result=str)
     def add_digsite(self, exp_fdb, payload_json):

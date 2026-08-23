@@ -205,11 +205,21 @@ function verifyIconsPpuipkg() {
                 if (info.exists) {
                     badge.className = 'badge badge-success';
                     badge.textContent = '✓ Verified';
-                    badge.title = `PPUIPKG & folder exist:\n${info.ppuipkg_file}\n${info.image_folder}`;
+                    badge.title = `Listed in the package and the art is on disk:\n${info.ppuipkg_file}\n${info.image_folder}`;
                 } else if (!info.file_exists) {
                     badge.className = 'badge badge-warning';
                     badge.textContent = '⚠️ PPUIPKG Missing';
-                    badge.title = `Missing file: ${info.ppuipkg_file}`;
+                    badge.title = `Missing file: ${info.ppuipkg_file}\nGenerate or update the mod to create it.`;
+                } else if (info.in_package === false) {
+                    // Distinct from a missing package: the package is there but
+                    // does not reference this icon, so the game will not find it.
+                    badge.className = 'badge badge-warning';
+                    badge.textContent = '⚠️ Not In Package';
+                    badge.title = `The package exists but has no <types> entry for this icon.\n${info.ppuipkg_file}`;
+                } else if (info.image_exists === false) {
+                    badge.className = 'badge badge-warning';
+                    badge.textContent = '⚠️ Art Missing';
+                    badge.title = `Referenced but no .png/.tex on disk:\n${info.image_folder}`;
                 } else {
                     badge.className = 'badge badge-warning';
                     badge.textContent = '⚠️ Image Dir Missing';
@@ -247,13 +257,14 @@ function saveIconsDirect() {
         backend.show_error("Please enter a Mod Project Name.");
         return;
     }
-    backend.save_mod_ppuipkg(modProject.mod_name, JSON.stringify(currentIcons), (resStr) => {
-        const res = JSON.parse(resStr);
-        if (res.success) {
-            backend.show_info(`Saved ${res.count} icons into userinterfaceimages${modProject.mod_name.toLowerCase()}.ppuipkg!`);
-            verifyIconsPpuipkg();
-        } else {
-            backend.show_error(res.error || "Failed to save PPUIPKG XML.");
-        }
-    });
+
+    // Icons are not a standalone XML edit. Enabling them also requires the
+    // deferred ACSE manager and AddLuaManagers registration in the mod's Lua
+    // database. The old direct writer produced a PPUIPKG without either one,
+    // leaving existing mods in a broken half-updated state.
+    if (typeof updateExistingProject !== 'function') {
+        backend.show_error("The complete mod update function is unavailable.");
+        return;
+    }
+    updateExistingProject();
 }

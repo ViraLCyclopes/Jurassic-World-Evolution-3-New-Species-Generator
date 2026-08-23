@@ -1,6 +1,9 @@
 import os
 import json
-import xml.etree.ElementTree as ET
+
+from core.ppuipkg import (
+    normalise_mod_asset_package, read_package, write_package,
+)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -20,28 +23,16 @@ def scan_mod_ppuipkg(mod_name):
                 if f.lower().endswith(".ppuipkg"):
                     pkg_path = os.path.join(root_dir, f)
                     try:
-                        tree = ET.parse(pkg_path)
-                        root = tree.getroot()
-                        nodes = root.findall(".//userinterfaceicondata")
-                        for node in nodes:
-                            name_elem = node.find("name")
-                            img_elem = node.find("image_name")
-                            pkg_elem = node.find("asset_package")
-
-                            img_path = img_elem.text if img_elem is not None and img_elem.text else ""
-                            pkg_name = pkg_elem.text if pkg_elem is not None and pkg_elem.text else os.path.basename(root_dir)
-
-                            if name_elem is not None and name_elem.text:
-                                icon_id = name_elem.text.strip()
-                            else:
-                                icon_id = os.path.splitext(os.path.basename(img_path))[0] if img_path else "Icon"
-
+                        _basic, _files, package_icons = read_package(pkg_path)
+                        for img_path, pkg_name in package_icons:
+                            icon_id = (os.path.splitext(os.path.basename(img_path))[0]
+                                       if img_path else "Icon")
                             if icon_id and icon_id not in seen_ids:
                                 seen_ids.add(icon_id)
                                 icons.append({
                                     "id": icon_id,
                                     "path": img_path,
-                                    "assetPackage": pkg_name
+                                    "assetPackage": pkg_name,
                                 })
                     except Exception:
                         pass
@@ -54,49 +45,40 @@ def save_mod_ppuipkg(mod_name, icons_json):
     try:
         icons = json.loads(icons_json) if isinstance(icons_json, str) else icons_json
         mod_root = os.path.join(BASE_DIR, "Generated", mod_name)
-        init_dir = os.path.join(mod_root, "Init")
-        os.makedirs(init_dir, exist_ok=True)
+        pkg_ui_dir = os.path.join(mod_root, "UI", mod_name)
+        os.makedirs(pkg_ui_dir, exist_ok=True)
+        pkg_path = os.path.join(
+            pkg_ui_dir, f"userinterfaceimages{mod_name.lower()}.ppuipkg")
 
-        icons_by_pkg = {}
+        icon_refs = []
+        seen = set()
         for icon in icons:
-            pkg_name = icon.get("assetPackage") or icon.get("asset_package") or mod_name
-            icons_by_pkg.setdefault(pkg_name, []).append(icon)
+            img_path = icon.get("path") or icon.get("image_name") or ""
+            if not img_path or img_path in seen:
+                continue
+            seen.add(img_path)
+            pkg_name = normalise_mod_asset_package(
+                mod_name,
+                icon.get("assetPackage")
+                or icon.get("asset_package")
+                or mod_name)
+            icon_refs.append((img_path, pkg_name))
 
-        if not icons_by_pkg:
-            icons_by_pkg[mod_name] = []
+            norm_img_path = img_path.replace("/", os.sep).replace("\\", os.sep)
+            dir_name = os.path.dirname(norm_img_path)
+            if dir_name:
+                os.makedirs(os.path.join(pkg_ui_dir, dir_name), exist_ok=True)
 
-        last_path = ""
-        for pkg_name, pkg_icons in icons_by_pkg.items():
-            pkg_ui_dir = os.path.join(mod_root, "UI", pkg_name)
-            os.makedirs(pkg_ui_dir, exist_ok=True)
-            pkg_path = os.path.join(pkg_ui_dir, f"userinterfaceimages{pkg_name.lower()}.ppuipkg")
+        # The editor owns only <types>. Preserve every embedded file (notably
+        # author SVGs) byte-for-byte when saving icon references.
+        existing_files = []
+        if os.path.isfile(pkg_path):
+            _basic, existing_files, _existing_icons = read_package(pkg_path)
+        write_package(pkg_path, f"{mod_name}/UI",
+                      files=existing_files, icons=icon_refs)
 
-            lines = [
-                '<PPUIPKGRoot file_count="0" icondata_count="{}" game="Jurassic World Evolution 3">'.format(len(pkg_icons)),
-                '\t<types>'
-            ]
-            for icon in pkg_icons:
-                icon_id = icon.get("id") or icon.get("name") or "Icon"
-                img_path = icon.get("path") or icon.get("image_name") or ""
-                lines.append('\t\t<userinterfaceicondata>')
-                lines.append('\t\t\t<name>{}</name>'.format(icon_id))
-                lines.append('\t\t\t<image_name>{}</image_name>'.format(img_path))
-                lines.append('\t\t\t<asset_package>{}</asset_package>'.format(pkg_name))
-                lines.append('\t\t</userinterfaceicondata>')
-
-                norm_img_path = img_path.replace("/", os.sep).replace("\\", os.sep)
-                dir_name = os.path.dirname(norm_img_path)
-                if dir_name:
-                    icon_folder = os.path.join(pkg_ui_dir, dir_name)
-                    os.makedirs(icon_folder, exist_ok=True)
-
-            lines.append('\t</types>')
-            lines.append('</PPUIPKGRoot>')
-            with open(pkg_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
-            last_path = pkg_path
-
-        return json.dumps({"success": True, "path": last_path, "count": len(icons)})
+        return json.dumps({"success": True, "path": pkg_path,
+                           "count": len(icon_refs)})
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)})
 
@@ -106,26 +88,54 @@ def verify_ppuipkg_paths(mod_name, icons_json_str):
         icons = json.loads(icons_json_str) if isinstance(icons_json_str, str) else (icons_json_str or [])
         mod_dir = os.path.join(BASE_DIR, "Generated", mod_name)
         results = {}
+        # The package lives at UI/<mod>/userinterfaceimages<mod>.ppuipkg - ONE
+        # per mod, named for the MOD.
+        #
+        # It is NOT named for the icon's asset_package. That field is an
+        # internal OVS stream name (Cobblestone: overlay `CobblestoneBlock`,
+        # asset package `images_cobblestoneblock_decoration`), and treating it
+        # as a folder made every icon whose package was not literally the mod
+        # name report a false "PPUIPKG Missing" - e.g. `Capiraptor_Dinosaur_Small`
+        # was looked up at UI/Capiraptor_Dinosaur_Small/, which never exists.
+        pkg_ui_dir = os.path.join(mod_dir, "UI", mod_name)
+        ppuipkg_file = os.path.join(
+            pkg_ui_dir, f"userinterfaceimages{mod_name.lower()}.ppuipkg")
+        file_exists = os.path.isfile(ppuipkg_file)
+
+        listed = set()
+        if file_exists:
+            try:
+                from core.ppuipkg import read_package
+                _basic, _files, pkg_icons = read_package(ppuipkg_file)
+                listed = {img for img, _p in pkg_icons}
+            except Exception:
+                listed = set()
+
         for icon in icons:
             icon_id = icon.get("id") or icon.get("name") or "icon"
-            pkg_name = icon.get("assetPackage") or icon.get("asset_package") or mod_name
             img_path = icon.get("path") or icon.get("image_name") or ""
-
-            pkg_ui_dir = os.path.join(mod_dir, "UI", pkg_name)
-            ppuipkg_file = os.path.join(pkg_ui_dir, f"userinterfaceimages{pkg_name.lower()}.ppuipkg")
 
             norm_img_path = img_path.replace("/", os.sep).replace("\\", os.sep)
             dir_name = os.path.dirname(norm_img_path)
             image_folder = os.path.join(pkg_ui_dir, dir_name) if dir_name else pkg_ui_dir
-
-            file_exists = os.path.isfile(ppuipkg_file)
             folder_exists = os.path.isdir(image_folder)
 
-            exists = file_exists and folder_exists
+            # cobra-tools ships a texture as the pair <name>.png.png + .png.tex,
+            # so check for the actual art rather than just its directory.
+            base = os.path.join(pkg_ui_dir, norm_img_path)
+            image_exists = (os.path.isfile(base + ".png")
+                            or os.path.isfile(base + ".tex")
+                            or os.path.isfile(base))
+
+            in_package = img_path in listed
+
+            exists = file_exists and folder_exists and in_package and image_exists
             results[icon_id] = {
                 "exists": exists,
                 "file_exists": file_exists,
                 "folder_exists": folder_exists,
+                "in_package": in_package,
+                "image_exists": image_exists,
                 "ppuipkg_file": ppuipkg_file,
                 "image_folder": image_folder
             }

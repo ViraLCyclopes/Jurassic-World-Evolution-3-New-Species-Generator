@@ -11,6 +11,81 @@ const ROOT_PROPERTIES_WHITELIST = [
     "DecalOffset"
 ];
 
+// Mirror of `normalise_scale_range()` in core/generator.py. A scale entry may be
+// a bare number (fixed size), a [min, max] pair, or a dict with min/max keys;
+// keep the two in step or the UI will show something the generator does not write.
+function readScaleBand(value, fallback) {
+    const fb = (fallback !== undefined && fallback !== null) ? fallback : 1.0;
+    let lo = null, hi = null;
+
+    if (value !== null && typeof value === 'object') {
+        if (Array.isArray(value)) {
+            lo = value[0];
+            hi = value.length >= 2 ? value[1] : value[0];
+        } else {
+            for (const k of ['min', 'fMin', 'Min', 'MinScale']) {
+                if (value[k] !== undefined && value[k] !== null) { lo = value[k]; break; }
+            }
+            for (const k of ['max', 'fMax', 'Max', 'MaxScale']) {
+                if (value[k] !== undefined && value[k] !== null) { hi = value[k]; break; }
+            }
+            // A dict carrying only one bound is a fixed size, not half a band.
+            if (lo === null) lo = hi;
+            if (hi === null) hi = lo;
+        }
+    } else if (value !== undefined && value !== null && value !== "") {
+        lo = hi = value;
+    }
+
+    let nLo = parseFloat(lo), nHi = parseFloat(hi);
+    if (isNaN(nLo) && isNaN(nHi)) { nLo = nHi = parseFloat(fb); }
+    if (isNaN(nLo)) nLo = nHi;
+    if (isNaN(nHi)) nHi = nLo;
+    if (isNaN(nLo)) nLo = nHi = 1.0;
+    return { min: nLo, max: nHi };
+}
+
+// Store a fixed size as a bare number so projects that never used a band keep
+// their original JSON shape; only a real band writes the {min, max} dict.
+function writeScaleBand(sp, memberKey, minVal, maxVal, vary) {
+    if (!sp.scales) sp.scales = {};
+    let lo = parseFloat(minVal), hi = parseFloat(maxVal);
+    if (isNaN(lo) && isNaN(hi)) { lo = hi = 1.0; }
+    if (isNaN(lo)) lo = hi;
+    if (!vary || isNaN(hi)) hi = lo;
+    sp.scales[memberKey] = (lo === hi) ? lo : { min: lo, max: hi };
+}
+
+// Show the max field only when varying, and keep the label and hint honest
+// about which of the two modes is in force.
+function updateScaleBandUI(panel) {
+    const label = panel.querySelector('.prefab-scale-label');
+    const hint = panel.querySelector('.prefab-scale-hint');
+    const minInput = panel.querySelector('.prefab-scale-min-input');
+    const maxInput = panel.querySelector('.prefab-scale-max-input');
+    const varyBox = panel.querySelector('.prefab-scale-vary');
+    if (!minInput || !maxInput || !varyBox) return;
+
+    const vary = varyBox.checked;
+    maxInput.style.display = vary ? '' : 'none';
+    minInput.placeholder = vary ? 'Min' : '1.0';
+    if (label) label.textContent = vary ? 'Render Scale Band (Min / Max):' : 'Render Scale Multiplier:';
+    if (!hint) return;
+
+    const lo = parseFloat(minInput.value), hi = parseFloat(maxInput.value);
+    // max < min is legal input mid-typing; the backend swaps it, so only warn.
+    if (vary && !isNaN(lo) && !isNaN(hi) && hi < lo) {
+        hint.textContent = 'Max is below Min — the bounds will be swapped on generate.';
+        hint.style.color = '#e0b34a';
+    } else if (vary) {
+        hint.textContent = 'Every animal rolls its own size inside this band.';
+        hint.style.color = '';
+    } else {
+        hint.textContent = 'Every animal is this exact size.';
+        hint.style.color = '';
+    }
+}
+
 function getInheritedPropValue(parentPrefabName, propName) {
     if (!prefabIndex || !parentPrefabName) return "";
     let current = parentPrefabName.toLowerCase();
@@ -32,6 +107,38 @@ function getInheritedPropValue(parentPrefabName, propName) {
         }
     }
     return "";
+}
+
+function resolveDefaultParentPrefab(sourceName, memberKey, suffix) {
+    if (!sourceName) return "";
+    const baseSrc = sourceName.trim().toLowerCase();
+
+    if (prefabIndex && prefabIndex.entries) {
+        if (memberKey === "Female" || suffix === "") {
+            if (prefabIndex.entries[baseSrc]) {
+                return prefabIndex.entries[baseSrc].name;
+            }
+            if (prefabIndex.entries[baseSrc + "_female"]) {
+                return prefabIndex.entries[baseSrc + "_female"].name;
+            }
+        } else if (memberKey === "Male" || suffix === "_male") {
+            if (prefabIndex.entries[baseSrc + "_male"]) {
+                return prefabIndex.entries[baseSrc + "_male"].name;
+            }
+            if (prefabIndex.entries[baseSrc]) {
+                return prefabIndex.entries[baseSrc].name;
+            }
+        } else if (memberKey === "Juvenile" || suffix === "_juvenile") {
+            if (prefabIndex.entries[baseSrc + "_juvenile"]) {
+                return prefabIndex.entries[baseSrc + "_juvenile"].name;
+            }
+            if (prefabIndex.entries[baseSrc]) {
+                return prefabIndex.entries[baseSrc].name;
+            }
+        }
+    }
+
+    return sourceName + suffix;
 }
 
 function populatePrefabTabs() {
@@ -93,26 +200,58 @@ function populatePrefabTabs() {
         contentContainer.appendChild(clone);
 
         const parentInput = panel.querySelector('.prefab-parent-input');
-        const scaleInput = panel.querySelector('.prefab-scale-input');
+        const scaleMinInput = panel.querySelector('.prefab-scale-min-input');
+        const scaleMaxInput = panel.querySelector('.prefab-scale-max-input');
         const dropdown = panel.querySelector('.search-dropdown');
         const propList = panel.querySelector('.properties-list');
 
-        let parentPrefabName = sp.source ? sp.source.toLowerCase() + m.suffix : "";
+        let parentPrefabName = "";
         if (sp.prefab_overrides && sp.prefab_overrides[memberKey] && sp.prefab_overrides[memberKey].Prefab) {
             parentPrefabName = sp.prefab_overrides[memberKey].Prefab;
+        } else if (sp.donor_prefabs && sp.donor_prefabs[memberKey]) {
+            parentPrefabName = sp.donor_prefabs[memberKey];
+        } else {
+            parentPrefabName = resolveDefaultParentPrefab(sp.source, memberKey, m.suffix);
         }
         parentInput.value = parentPrefabName;
 
+
+
+
+
         if (!sp.scales) sp.scales = {};
-        const memberScale = (sp.scales[memberKey] !== undefined && sp.scales[memberKey] !== null) ? sp.scales[memberKey] : (sp.scale !== undefined && sp.scale !== null ? sp.scale : 1.0);
-        if (scaleInput) {
-            scaleInput.value = memberScale;
-            scaleInput.addEventListener('input', () => {
-                const num = parseFloat(scaleInput.value);
-                if (!sp.scales) sp.scales = {};
-                sp.scales[memberKey] = !isNaN(num) ? num : 1.0;
+        const memberScale = (sp.scales[memberKey] !== undefined && sp.scales[memberKey] !== null) ? sp.scales[memberKey] : sp.scale;
+        const band = readScaleBand(memberScale, 1.0);
+        const varyBox = panel.querySelector('.prefab-scale-vary');
+        if (scaleMinInput && scaleMaxInput) {
+            scaleMinInput.value = band.min;
+            scaleMaxInput.value = band.max;
+            // A stored band with two different bounds is what "varying" means,
+            // so an existing project re-opens with the box already ticked.
+            if (varyBox) varyBox.checked = band.min !== band.max;
+            updateScaleBandUI(panel);
+
+            const commitScale = () => {
+                writeScaleBand(sp, memberKey, scaleMinInput.value, scaleMaxInput.value,
+                               varyBox ? varyBox.checked : false);
+                updateScaleBandUI(panel);
                 savePrefabProperties(memberKey, panel, sp);
+            };
+
+            [scaleMinInput, scaleMaxInput].forEach(input => {
+                input.addEventListener('input', commitScale);
             });
+            if (varyBox) {
+                varyBox.addEventListener('change', () => {
+                    // Turning variation on with both bounds equal reads as "no
+                    // variation" to the backend, so seed a visible band.
+                    if (varyBox.checked && scaleMaxInput.value === scaleMinInput.value) {
+                        const lo = parseFloat(scaleMinInput.value);
+                        if (!isNaN(lo)) scaleMaxInput.value = (Math.round(lo * 1.2 * 100) / 100);
+                    }
+                    commitScale();
+                });
+            }
         }
 
         renderPrefabProperties(memberKey, parentInput.value, propList, sp);
@@ -153,9 +292,10 @@ function populatePrefabTabs() {
 function renderPrefabProperties(memberKey, parentPrefabName, container, sp) {
     container.innerHTML = '';
 
+    const hasOverrideObj = !!(sp.prefab_overrides && sp.prefab_overrides[memberKey]);
     if (!sp.prefab_overrides) sp.prefab_overrides = {};
     if (!sp.prefab_overrides[memberKey]) sp.prefab_overrides[memberKey] = { Properties: {} };
-    const savedProps = sp.prefab_overrides[memberKey].Properties;
+    const savedProps = sp.prefab_overrides[memberKey].Properties || {};
 
     ROOT_PROPERTIES_WHITELIST.forEach(propName => {
         const template = document.getElementById('tpl-property-row');
@@ -172,8 +312,23 @@ function renderPrefabProperties(memberKey, parentPrefabName, container, sp) {
         let isSaved = savedProps && savedProps[propName] !== undefined;
 
         if (isSaved) {
-            val = savedProps[propName].Default;
+            const rawProp = savedProps[propName];
+            val = (rawProp && typeof rawProp === 'object' && !Array.isArray(rawProp) && rawProp.Default !== undefined)
+                  ? rawProp.Default
+                  : rawProp;
             cbEnable.checked = true;
+        } else if (hasOverrideObj) {
+            val = getInheritedPropValue(parentPrefabName, propName);
+
+            if (sp.source && sp.name && val) {
+                const re = new RegExp(sp.source, 'gi');
+                if (Array.isArray(val)) {
+                    val = val.map(s => typeof s === 'string' ? s.replace(re, sp.name) : s);
+                } else if (typeof val === 'string') {
+                    val = val.replace(re, sp.name);
+                }
+            }
+            cbEnable.checked = false;
         } else {
             val = getInheritedPropValue(parentPrefabName, propName);
 
@@ -190,7 +345,11 @@ function renderPrefabProperties(memberKey, parentPrefabName, container, sp) {
             cbEnable.checked = hasVal;
         }
 
-        if (propName === 'AssetPackages' || Array.isArray(val)) {
+
+        let inheritedVal = val;
+        let activeVal = cbEnable.checked ? val : "";
+
+        if (propName === 'AssetPackages' || Array.isArray(inheritedVal)) {
             valInput.style.display = 'none';
             row.dataset.isArray = "true";
 
@@ -238,23 +397,43 @@ function renderPrefabProperties(memberKey, parentPrefabName, container, sp) {
                 arrayContainer.appendChild(addBtn);
             };
 
-            let arr = Array.isArray(val) ? val : (val ? val.split(',').map(s => s.trim()).filter(s => s) : []);
-            if (arr.length === 0) arr = [""];
+            let arr = [];
+            if (cbEnable.checked) {
+                arr = Array.isArray(val) ? val : (val ? String(val).split(',').map(s => s.trim()).filter(s => s) : []);
+                if (arr.length === 0) arr = [""];
+            }
+
             renderArray(arr);
 
         } else {
-            valInput.value = val;
+            valInput.value = cbEnable.checked ? (val !== undefined && val !== null ? val : "") : "";
+            valInput.placeholder = inheritedVal ? `(Inherited: ${inheritedVal})` : "";
             valInput.addEventListener('input', () => {
                 if (valInput.value.trim() !== "") cbEnable.checked = true;
                 savePrefabProperties(memberKey, container, sp);
             });
         }
 
-        cbEnable.addEventListener('change', () => savePrefabProperties(memberKey, container, sp));
+        cbEnable.addEventListener('change', () => {
+            if (!cbEnable.checked) {
+                valInput.value = "";
+                if (row.dataset.isArray === "true") {
+                    const arrContainer = row.querySelector('.prop-array-container');
+                    if (arrContainer) {
+                        const items = arrContainer.querySelectorAll('.asset-package-row');
+                        items.forEach(it => it.remove());
+                    }
+                }
+            } else if (!valInput.value && inheritedVal && !Array.isArray(inheritedVal)) {
+                valInput.value = inheritedVal;
+            }
+            savePrefabProperties(memberKey, container, sp);
+        });
 
         container.appendChild(clone);
     });
 }
+
 
 function savePrefabProperties(memberKey, container, sp) {
     if (!sp) return;
@@ -265,14 +444,20 @@ function savePrefabProperties(memberKey, container, sp) {
     if (panel) {
         const parentInput = panel.querySelector('.prefab-parent-input');
         if (parentInput && parentInput.value.trim()) {
-            sp.prefab_overrides[memberKey].Prefab = parentInput.value.trim();
+            const pVal = parentInput.value.trim();
+            sp.prefab_overrides[memberKey].Prefab = pVal;
+            if (!sp.donor_prefabs) sp.donor_prefabs = {};
+            sp.donor_prefabs[memberKey] = pVal;
         }
-        const scaleInput = panel.querySelector('.prefab-scale-input');
-        if (scaleInput && scaleInput.value.trim()) {
-            const num = parseFloat(scaleInput.value.trim());
-            if (!sp.scales) sp.scales = {};
-            sp.scales[memberKey] = !isNaN(num) ? num : 1.0;
+        const scaleMinInput = panel.querySelector('.prefab-scale-min-input');
+        const scaleMaxInput = panel.querySelector('.prefab-scale-max-input');
+        const varyBox = panel.querySelector('.prefab-scale-vary');
+        if (scaleMinInput && scaleMaxInput
+            && (scaleMinInput.value.trim() || scaleMaxInput.value.trim())) {
+            writeScaleBand(sp, memberKey, scaleMinInput.value.trim(), scaleMaxInput.value.trim(),
+                           varyBox ? varyBox.checked : false);
         }
+
     }
 
 
@@ -305,10 +490,13 @@ function savePrefabProperties(memberKey, container, sp) {
                 } else {
                     val = valStr;
                 }
-                props[name] = { Default: val };
+                if (val !== "" && val !== null && val !== undefined) {
+                    props[name] = { Default: val };
+                }
             }
         }
     });
+
 
     sp.prefab_overrides[memberKey].Properties = props;
 }

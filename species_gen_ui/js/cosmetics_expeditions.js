@@ -8,20 +8,51 @@ function refreshBuiltMods() {
     backend.list_built_mods((resStr) => {
         const res = JSON.parse(resStr);
         if (!res.success) { backend.show_error(res.error); return; }
-        builtMods = res.data || [];
+        const rawData = res.data || [];
+        builtMods = rawData.map(m => {
+            if (typeof m === 'string') {
+                const dino = `SpeciesGenerator/Generated/${m}/Main/${m.toLowerCase()}dinosaurs.fdb`;
+                const exp = `SpeciesGenerator/Generated/${m}/Main/${m.toLowerCase()}expeditions.fdb`;
+                return {
+                    name: m,
+                    fdb: dino,
+                    dino_fdb: dino,
+                    exp_fdb: exp
+                };
+            }
+            if (m && typeof m === 'object') {
+                m.fdb = m.fdb || m.dino_fdb;
+                m.dino_fdb = m.dino_fdb || m.fdb;
+            }
+            return m;
+        });
+
+
         ['editor-mod', 'exp-mod'].forEach(id => {
             const sel = document.getElementById(id);
             if (!sel) return;
             const prev = sel.value;
             sel.innerHTML = '';
+
+            const defaultOpt = document.createElement('option');
+            defaultOpt.value = '';
+            defaultOpt.textContent = '-- Select a Generated Mod --';
+            sel.appendChild(defaultOpt);
+
             builtMods.forEach((m, i) => {
                 const o = document.createElement('option');
                 o.value = String(i);
                 o.textContent = m.name + (id === 'exp-mod' && !m.exp_fdb ? '  (no expeditions FDB)' : '');
                 sel.appendChild(o);
             });
-            if (prev && sel.querySelector(`option[value="${prev}"]`)) sel.value = prev;
+
+            if (prev !== "" && prev !== null && sel.querySelector(`option[value="${prev}"]`)) {
+                sel.value = prev;
+            } else {
+                sel.value = '';
+            }
         });
+
         if (builtMods.length === 0) {
             const g = document.getElementById('editor-grid');
             if (g) g.innerHTML = '<p class="hint">No generated mods found yet. Build one first.</p>';
@@ -33,9 +64,12 @@ function refreshBuiltMods() {
 
 function selectedMod(selectId) {
     const sel = document.getElementById(selectId);
-    if (!sel || !sel.value) return null;
-    return builtMods[parseInt(sel.value)] || null;
+    if (!sel || sel.value === "" || sel.value === null) return null;
+    const idx = parseInt(sel.value, 10);
+    if (isNaN(idx) || idx < 0 || idx >= builtMods.length) return null;
+    return builtMods[idx] || null;
 }
+
 
 function setupEditorPage() {
     const load = document.getElementById('btn-editor-load');
@@ -48,12 +82,13 @@ function setupEditorPage() {
         const mod = selectedMod('editor-mod');
         if (!mod) { backend.show_error("Pick a generated mod first."); return; }
         const table = document.getElementById('editor-table').value;
-        backend.load_mod_table(mod.fdb, table, (resStr) => {
+        const fdbPath = mod.dino_fdb || mod.fdb;
+        backend.load_mod_table(fdbPath, table, (resStr) => {
             const res = JSON.parse(resStr);
             if (!res.success) { backend.show_error(res.error); return; }
             editorTable = res.data;
             renderEditorGrid(editorTable, 'editor-grid');
-            checkEditorProblems(mod.fdb);
+            checkEditorProblems(fdbPath);
         });
     };
 
@@ -62,6 +97,7 @@ function setupEditorPage() {
         const mod = selectedMod('editor-mod');
         if (!mod || !editorTable) return;
         const table = document.getElementById('editor-table').value;
+        const fdbPath = mod.dino_fdb || mod.fdb;
 
         const container = document.getElementById('editor-grid');
         const trs = container.querySelectorAll('tbody tr');
@@ -77,7 +113,7 @@ function setupEditorPage() {
         }
         editorTable.rows = newRows;
 
-        backend.save_mod_table(mod.fdb, table, JSON.stringify(editorTable), (resStr) => {
+        backend.save_mod_table(fdbPath, table, JSON.stringify(editorTable), (resStr) => {
             const res = JSON.parse(resStr);
             if (!res.success) {
                 backend.show_error(res.error);
@@ -87,6 +123,7 @@ function setupEditorPage() {
             alert(`Saved ${res.written} rows to ${table}.`);
         });
     };
+
 
     add.onclick = () => {
         if (typeof logButtonClick === 'function') logButtonClick('btn-editor-addrow', 'Add Row to Mod Table');

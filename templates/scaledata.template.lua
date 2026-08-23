@@ -1,39 +1,35 @@
 -----------------------------------------------------------------------
 --/  @file   Database.MDDeinosuchusScaleData.lua
 --/
---/  @brief  Render-scale hook for the Deinodoot (Deinosuchus) species.
+--/  @brief  Per-species render-scale bands, and the spawn hook that
+--/          rolls an individual scale inside them.
 --/
---/          Same technique as the JWE3 "Breeding Hybrids" mod: wrap
---/          Helpers.DinosaurUtils.InstantiateDinosaur and call
---/          api.transform.SetScale() on the entity ID it returns.
+--/          Planet Zoo stores adult size variation per animal in
+--/          animals.fdb (SizeData.MinScaleMale / MaxScaleMale /
+--/          MinScaleFemale / MaxScaleFemale) and rolls it natively.
+--/          JWE3's dinosaur database has no equivalent column, so the
+--/          bands live here and the roll happens in Lua.
 --/
---/          The wrapper is installed through several redundant paths,
+--/          This module owns the DATA and the HOOK. The lifecycle -
+--/          re-applying the scale, discovering save-restored animals,
+--/          and persisting each rolled value into the save - lives in
+--/          Components.MDDeinosuchusScaleController.
+--/
+--/  @note   Tune the bands in the two tables below. Species IDs take
+--/          priority over genome names. Each entry is a uniform
+--/          multiplier band; fMin == fMax gives a fixed size, which is
+--/          how a mod with no size variation is expressed.
+--/
+--/  @note   The hook is installed through several redundant paths,
 --/          because a single ACSE require-hook on helpers.dinosaurutils
 --/          is missed if that module was already loaded before the hook
---/          list was collected (this is why Breeding Hybrids also wraps
---/          genome-library manager methods as a lazy installer):
---/            1. Immediately, when ACSE collects AddLuaHooks.
---/            2. ACSE require-hook on helpers.dinosaurutils itself.
---/            3. ACSE require-hooks on modules that load with the park
---/               world (hatchery, spawn manager, genome library, ...).
---/            4. BH-style method wraps on the genome library manager /
---/               UI mode that retry the install at runtime.
---/          All paths are idempotent (guarded by a flag on the module).
---/
---/  @note   Tune the scale values in the two tables below. Species IDs
---/          take priority over genome names. Values are uniform
---/          multipliers on the Dimetrodon rig the Deinodoot uses.
---/
---/  @note   Applying the scale once at spawn is not enough: the game
---/          sets the dinosaur transform again when the hatchery places
---/          the animal, wiping the spawn-time scale. Like the Planet Zoo
---/          JuvenileScale component (which re-applies every 30s from
---/          Advance), we track scaled entities and re-apply the scale
---/          every few seconds from GenomeLibraryManager.Advance.
+--/          list was collected. All paths are idempotent.
 --/
 --/  @note   With the ACSEDebug mod installed, the console shows
---/          "MDDeinosuchus:" trace lines, and two commands are added:
---/          DeinoScaleStatus and SetDinoScale <entityID> <scale>.
+--/          "MDDeinosuchus:" trace lines and gains the commands
+--/          MDDeinosuchusScaleStatus and MDDeinosuchusSetScale.
+--/
+--/  @see    https://github.com/OpenNaja/ACSE
 -----------------------------------------------------------------------
 local global = _G
 local api = global.api
@@ -47,41 +43,34 @@ local unpack = global.unpack or (global.table and global.table.unpack)
 
 local MDDeinosuchusScaleData = module(...)
 
--- Scale by species ID (from mddeinosuchusdinosaurs.fdb, Species table)
+-- Scale bands by species ID (from the mod's dinosaurs.fdb, Species table).
 MDDeinosuchusScaleData.tRenderScalesBySpeciesID = {
-    [41726] = 5.25, -- Deinodoot (adult female)
-    [41727] = 5.25, -- Deinodoot_Male (adult male)
-    [41728] = 5.25, -- Deinodoot_Juvenile
+    [41726] = { fMin = 5.25, fMax = 5.25 }, -- Deinodoot (adult female)
+    [41727] = { fMin = 5.25, fMax = 5.25 }, -- Deinodoot_Male (adult male)
+    [41728] = { fMin = 5.25, fMax = 5.25 }, -- Deinodoot_Juvenile
 }
 
--- Fallback: scale by genome / species name, for call sites that pass
--- sGenomeID (or sGenome) instead of nSpeciesID.
+-- Fallback: bands by genome / species name, for call sites that pass
+-- sGenomeID (or sGenome) instead of nSpeciesID, and for the discovery
+-- pass, which only has a species name to go on.
 MDDeinosuchusScaleData.tRenderScalesByGenome = {
-    ["Deinodoot"]          = 5.25,
-    ["Deinodoot_Male"]     = 5.25,
-    ["Deinodoot_Juvenile"] = 5.25,
+    ["Deinodoot"]          = { fMin = 5.25, fMax = 5.25 },
+    ["Deinodoot_Male"]     = { fMin = 5.25, fMax = 5.25 },
+    ["Deinodoot_Juvenile"] = { fMin = 5.25, fMax = 5.25 },
 }
 
--- Entities we have scaled, and the re-application timer. The transform
--- gets rewritten by the game when the dinosaur is placed/released, so
--- the scale is re-applied periodically from a wrapped Advance below.
-MDDeinosuchusScaleData.tScaledEntities = {}
-MDDeinosuchusScaleData.fReapplyInterval = 2.0 -- seconds
-MDDeinosuchusScaleData._fReapplyAccum = 0
-MDDeinosuchusScaleData._nReapplyPasses = 0
+--//
+--// @brief Fetch the live scale controller, or nil before the world is up.
+--//
+MDDeinosuchusScaleData._GetController = function()
+    return api.mddeinosuchusscalecontroller
+end
 
--- Save-restored dinosaurs never pass through InstantiateDinosaur, so
--- they must be discovered in the world (dinosaursAPI:GetDinosaurs) and
--- adopted. Discovery only starts this many seconds after a world begins,
--- so we never touch entities that are still async-restoring (scaling an
--- entity mid-restore breaks it: T-pose/frozen/unclickable).
-MDDeinosuchusScaleData.fDiscoveryGrace = 10.0 -- seconds
-MDDeinosuchusScaleData._fWorldAge = 0
-MDDeinosuchusScaleData._tLastWorld = nil
-
--- Resolve the render scale for one InstantiateDinosaur params table,
--- or nil if this dinosaur is not ours.
-MDDeinosuchusScaleData._GetScaleFor = function(tDinosaurData)
+--//
+--// @brief Resolve the scale band for one InstantiateDinosaur params
+--//        table, or nil if this dinosaur is not ours.
+--//
+MDDeinosuchusScaleData._GetRangeFor = function(tDinosaurData)
     if type(tDinosaurData) ~= "table" then
         return nil
     end
@@ -96,9 +85,11 @@ MDDeinosuchusScaleData._GetScaleFor = function(tDinosaurData)
     return nil
 end
 
--- Wrap InstantiateDinosaur on the Helpers.DinosaurUtils module table.
--- DinosaurUtils.InstantiateDinosaur is dot-called with the dinosaur
--- params table first; the first return value is the entity ID.
+--//
+--// @brief Wrap InstantiateDinosaur on the Helpers.DinosaurUtils module.
+--//        It is dot-called with the dinosaur params table first, and
+--//        its first return value is the new entity ID.
+--//
 MDDeinosuchusScaleData._InstallScaleHook = function(tModule)
     if type(tModule) ~= "table" or tModule.__MDDeinosuchusScaleHooked then
         return false
@@ -112,21 +103,10 @@ MDDeinosuchusScaleData._InstallScaleHook = function(tModule)
     tModule.InstantiateDinosaur = function(tDinosaurData, ...)
         local tResults = { fnOriginal(tDinosaurData, ...) }
         pcall(function()
-            local fScale = MDDeinosuchusScaleData._GetScaleFor(tDinosaurData)
-            if fScale and type(tResults[1]) == "number" and tResults[1] ~= 0 then
-                api.transform.SetScale(tResults[1], fScale)
-                -- Stamp the entry with the current world's API table so
-                -- reapply can tell this world's entities apart from stale
-                -- IDs left over from a previous session (entity IDs are
-                -- REUSED between save loads).
-                MDDeinosuchusScaleData.tScaledEntities[tResults[1]] = {
-                    fScale = fScale,
-                    tWorld = api.world.GetWorldAPIs(),
-                }
-                api.debug.Trace(
-                    "MDDeinosuchus: SetScale(" .. tostring(tResults[1]) ..
-                    ", " .. tostring(fScale) .. ") + tracked for reapply"
-                )
+            local tRange = MDDeinosuchusScaleData._GetRangeFor(tDinosaurData)
+            local controller = MDDeinosuchusScaleData._GetController()
+            if tRange and controller and type(tResults[1]) == "number" then
+                controller:TrackDinosaur(tResults[1], tRange)
             end
         end)
         return unpack(tResults)
@@ -136,166 +116,14 @@ MDDeinosuchusScaleData._InstallScaleHook = function(tModule)
     return true
 end
 
--- Lazy installer: fetch (or load) Helpers.DinosaurUtils and patch it.
--- Safe to call any number of times, from any point in the boot/park
--- lifecycle.
+--//
+--// @brief Lazy installer. Safe to call any number of times, from any
+--//        point in the boot/park lifecycle.
+--//
 MDDeinosuchusScaleData._TryInstall = function()
     local bOK, tDinosaurUtils = pcall(require, "Helpers.DinosaurUtils")
     if bOK and type(tDinosaurUtils) == "table" then
         MDDeinosuchusScaleData._InstallScaleHook(tDinosaurUtils)
-    end
-end
-
--- Re-apply the scale to every tracked entity. Called (throttled) from
--- the wrapped GenomeLibraryManager.Advance, so it keeps winning against
--- whatever the placement/release code writes into the transform.
-MDDeinosuchusScaleData._ReapplyScales = function(nDeltaTime)
-    MDDeinosuchusScaleData._fWorldAge =
-        MDDeinosuchusScaleData._fWorldAge + (nDeltaTime or 0)
-    MDDeinosuchusScaleData._fReapplyAccum =
-        MDDeinosuchusScaleData._fReapplyAccum + (nDeltaTime or 0)
-    if MDDeinosuchusScaleData._fReapplyAccum < MDDeinosuchusScaleData.fReapplyInterval then
-        return
-    end
-    MDDeinosuchusScaleData._fReapplyAccum = 0
-
-    -- Entity IDs are reused between save loads, so only touch entities
-    -- tracked in THIS world session; silently drop anything stale.
-    -- SetScale on a stale ID during a reload hits the new world's
-    -- entities mid-initialization and breaks them (T-pose, frozen).
-    local tCurrentWorld = nil
-    pcall(function()
-        tCurrentWorld = api.world.GetWorldAPIs()
-    end)
-
-    -- Detect a world change and restart the discovery grace timer.
-    if tCurrentWorld ~= MDDeinosuchusScaleData._tLastWorld then
-        MDDeinosuchusScaleData._tLastWorld = tCurrentWorld
-        MDDeinosuchusScaleData._fWorldAge = 0
-    end
-
-    -- Discovery: adopt untracked Deinodoots already in the world (save
-    -- restore does not go through InstantiateDinosaur). Only after the
-    -- grace period, so restoring entities are never touched.
-    if tCurrentWorld and
-            MDDeinosuchusScaleData._fWorldAge >= MDDeinosuchusScaleData.fDiscoveryGrace then
-        pcall(function()
-            local dinosAPI = tCurrentWorld.dinosaurs
-            if not dinosAPI then
-                return
-            end
-            local tDinosaurs = dinosAPI:GetDinosaurs(true)
-            for _, nEntityID in ipairs(tDinosaurs) do
-                if not MDDeinosuchusScaleData.tScaledEntities[nEntityID] then
-                    local sSpeciesName = dinosAPI:GetBaseSpeciesName(nEntityID)
-                    local fScale = sSpeciesName and
-                        MDDeinosuchusScaleData.tRenderScalesByGenome[sSpeciesName]
-                    if fScale then
-                        MDDeinosuchusScaleData.tScaledEntities[nEntityID] = {
-                            fScale = fScale,
-                            tWorld = tCurrentWorld,
-                        }
-                        api.debug.Trace("MDDeinosuchus: adopted world dinosaur " ..
-                            tostring(nEntityID) .. " (" .. sSpeciesName .. ")")
-                    end
-                end
-            end
-        end)
-    end
-
-    local nCount = 0
-    local nDropped = 0
-    for nEntityID, tEntry in pairs(MDDeinosuchusScaleData.tScaledEntities) do
-        if type(tEntry) ~= "table" or tEntry.tWorld ~= tCurrentWorld then
-            MDDeinosuchusScaleData.tScaledEntities[nEntityID] = nil
-            nDropped = nDropped + 1
-        else
-            pcall(api.transform.SetScale, nEntityID, tEntry.fScale)
-            nCount = nCount + 1
-        end
-    end
-
-    if nDropped > 0 then
-        api.debug.Trace("MDDeinosuchus: dropped " .. tostring(nDropped) ..
-            " stale tracked entities from a previous world session")
-    end
-
-    -- Trace the first few passes only, to confirm it runs without
-    -- spamming the log forever.
-    if nCount > 0 and MDDeinosuchusScaleData._nReapplyPasses < 5 then
-        MDDeinosuchusScaleData._nReapplyPasses =
-            MDDeinosuchusScaleData._nReapplyPasses + 1
-        api.debug.Trace(
-            "MDDeinosuchus: reapplied scale to " .. tostring(nCount) ..
-            " entities (pass " ..
-            tostring(MDDeinosuchusScaleData._nReapplyPasses) .. ")"
-        )
-    end
-end
-
--- BH-style runtime retry: wrap a few frequently-called methods so the
--- installer keeps being retried once the park world is really up.
-MDDeinosuchusScaleData._tRetryMethods = {
-    ["managers.genomelibrarymanager"] = {
-        "_RefreshDataStoreForItem",
-        "_RefreshSynthesiseDinosaurButton",
-        "_OnDinosaurCohabitationSettingsChangedMessage",
-    },
-    ["editors.genomelibrary.genomelibraryuimode"] = {
-        "Run",
-        "_Handle_UI_ModifyGenome",
-        "_UpdateDisplayedDino",
-    },
-}
-
-MDDeinosuchusScaleData._WrapRetryMethods = function(tModule, tMethodNames)
-    if type(tModule) ~= "table" or tModule.__MDDeinosuchusScaleRetryWrapped then
-        return
-    end
-    tModule.__MDDeinosuchusScaleRetryWrapped = true
-    for _, sMethod in ipairs(tMethodNames) do
-        local fnOriginal = tModule[sMethod]
-        if type(fnOriginal) == "function" then
-            tModule[sMethod] = function(...)
-                pcall(MDDeinosuchusScaleData._TryInstall)
-                return fnOriginal(...)
-            end
-        end
-    end
-
-    MDDeinosuchusScaleData._WrapAdvance(tModule)
-end
-
--- Piggyback the periodic scale re-application on a manager's per-frame
--- Advance. Applied to every hooked manager that has one; the reapply
--- itself is throttled, so multiple wrapped Advances are harmless.
-MDDeinosuchusScaleData._WrapAdvance = function(tModule)
-    if type(tModule) ~= "table" or tModule.__MDDeinosuchusScaleAdvanceWrapped then
-        return
-    end
-    local fnAdvance = tModule.Advance
-    if type(fnAdvance) ~= "function" then
-        return
-    end
-    tModule.__MDDeinosuchusScaleAdvanceWrapped = true
-    tModule.Advance = function(self, nDeltaTime, ...)
-        pcall(MDDeinosuchusScaleData._ReapplyScales, nDeltaTime)
-        return fnAdvance(self, nDeltaTime, ...)
-    end
-
-    -- Clear all tracked entities when the world tears down (manager
-    -- Shutdown), so an in-session save reload never reapplies scale to
-    -- stale entity IDs from the previous session.
-    local fnShutdown = tModule.Shutdown
-    if type(fnShutdown) == "function" then
-        tModule.Shutdown = function(...)
-            MDDeinosuchusScaleData.tScaledEntities = {}
-            MDDeinosuchusScaleData._fReapplyAccum = 0
-            MDDeinosuchusScaleData._fWorldAge = 0
-            MDDeinosuchusScaleData._tLastWorld = nil
-            api.debug.Trace("MDDeinosuchus: world teardown, cleared tracked entities")
-            return fnShutdown(...)
-        end
     end
 end
 
@@ -306,62 +134,68 @@ MDDeinosuchusScaleData._tCarrierModules = {
     "components.nestingarea",
     "managers.dinosaurspawnmanager",
     "managers.dinosaurloanmanager",
+    "managers.genomelibrarymanager",
 }
 
--- ACSE content hook: register all install paths.
+--//
+--// @brief ACSE content hook: register the scale controller component.
+--//
+MDDeinosuchusScaleData.AddLuaComponents = function(_fnAdd)
+    _fnAdd("MDDeinosuchusScaleController", "components.mddeinosuchusscalecontroller")
+end
+
+--//
+--// @brief ACSE content hook: install the instantiate hook.
+--//
 MDDeinosuchusScaleData.AddLuaHooks = function(_fnAdd)
-    -- Path 2: direct require-hook (works when DinosaurUtils loads late)
+    -- Direct require-hook, for when DinosaurUtils loads late.
     _fnAdd("helpers.dinosaurutils", MDDeinosuchusScaleData._InstallScaleHook)
 
-    -- Path 3: carrier modules (also gain the Advance reapply wrap when
-    -- they have a per-frame Advance, e.g. the spawn/loan managers)
+    -- Carrier modules, for when it has already loaded.
     for _, sModuleName in ipairs(MDDeinosuchusScaleData._tCarrierModules) do
-        local sName = sModuleName
-        _fnAdd(sName, function(tModule)
-            api.debug.Trace("MDDeinosuchus: module hook fired for " .. sName)
+        _fnAdd(sModuleName, function(tModule)
             MDDeinosuchusScaleData._TryInstall()
-            MDDeinosuchusScaleData._WrapAdvance(tModule)
         end)
     end
 
-    -- Path 4: retry wraps on genome library manager / UI mode
-    for sModuleName, tMethods in pairs(MDDeinosuchusScaleData._tRetryMethods) do
-        local sName = sModuleName
-        local tMethodNames = tMethods
-        _fnAdd(sName, function(tModule)
-            api.debug.Trace("MDDeinosuchus: module hook fired for " .. sName)
-            MDDeinosuchusScaleData._TryInstall()
-            MDDeinosuchusScaleData._WrapRetryMethods(tModule, tMethodNames)
-        end)
-    end
-
-    -- Path 1: try right now, in case DinosaurUtils is already loaded
+    -- And try right now, in case it is loaded already.
     pcall(MDDeinosuchusScaleData._TryInstall)
 end
 
--- Debug console commands (visible with the ACSEDebug mod installed).
+--//
+--// @brief Debug console commands (visible with the ACSEDebug mod).
+--//
 MDDeinosuchusScaleData.AddLuaCommands = function(_fnAdd)
-    _fnAdd("&Deino&Scale&Status", {
+    _fnAdd("&MDDeinosuchus&Scale&Status", {
         function(tEnv, tArgs)
             local bOK, tDinosaurUtils = pcall(require, "Helpers.DinosaurUtils")
             local bLoaded = bOK and type(tDinosaurUtils) == "table"
             local sMsg = "DinosaurUtils loaded: " .. tostring(bLoaded)
             if bLoaded then
-                sMsg = sMsg .. " | scale hook installed: " ..
+                sMsg = sMsg .. " | hook installed: " ..
                     tostring(tDinosaurUtils.__MDDeinosuchusScaleHooked == true)
+            end
+            local controller = MDDeinosuchusScaleData._GetController()
+            sMsg = sMsg .. " | controller: " .. tostring(controller ~= nil)
+            if controller then
+                sMsg = sMsg .. " | tracked: " .. tostring(controller:GetTrackedCount())
             end
             return true, sMsg
         end,
-        "Reports whether the Deinodoot scale hook is installed.\n"
+        "Reports whether the scale hook and controller are live.\n"
     })
-    _fnAdd("&Set&Dino&Scale {int32} {float}", {
+    _fnAdd("&MDDeinosuchus&Set&Scale {int32} {float}", {
         function(tEnv, tArgs)
             if #tArgs ~= 2 then
                 return false, "Requires an entity ID and a scale value."
             end
-            api.transform.SetScale(tArgs[1], tArgs[2])
+            local controller = MDDeinosuchusScaleData._GetController()
+            if not controller then
+                return false, "Scale controller is not active."
+            end
+            controller:SetDinosaurScale(tArgs[1], tArgs[2])
             return true, "Scale applied to entity " .. tostring(tArgs[1])
         end,
-        "Applies a render scale to an entity: SetDinoScale <entityID> <scale>\n"
+        "Overrides one dinosaur's scale: MDDeinosuchusSetScale <entityID> <scale>\n"
     })
 end

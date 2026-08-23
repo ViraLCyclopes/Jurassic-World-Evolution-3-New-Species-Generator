@@ -73,7 +73,7 @@ def build(dump_path=DUMP):
     parents_seen = set()
 
     cur = None          # current entry dict
-    depth = 0
+    children_depth = None
     pending_prop = None  # property key whose Default= we are waiting for
 
     with open(dump_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -87,6 +87,7 @@ def build(dump_path=DUMP):
                            "is_variant": bool(VARIANT_RE.search(name))}
                     entries[name] = cur
                     depth = line.count("{") - line.count("}")
+                    children_depth = None
                     pending_prop = None
                     continue
 
@@ -96,18 +97,30 @@ def build(dump_path=DUMP):
             depth += line.count("{") - line.count("}")
             if depth <= 0:
                 cur = None
+                children_depth = None
                 pending_prop = None
                 continue
 
+            if "Children = {" in line and children_depth is None:
+                children_depth = depth
+
+            if children_depth is not None and depth < children_depth:
+                children_depth = None
+
+            if children_depth is not None:
+                continue
+
             m = PARENT_RE.match(line)
-            if m:
+            if m and cur["parent"] is None:
                 cur["parent"] = m.group(1)
                 parents_seen.add(m.group(1).lower())
                 continue
 
             m = PROPKEY_RE.match(line)
             if m:
-                pending_prop = m.group(1)
+                prop = m.group(1)
+                if prop not in cur["props"]:
+                    pending_prop = prop
                 continue
 
             if pending_prop:
@@ -115,6 +128,9 @@ def build(dump_path=DUMP):
                 if m:
                     cur["props"][pending_prop] = m.group(1)
                     pending_prop = None
+
+
+
 
     referenced_only = sorted(p for p in parents_seen if p not in entries)
     return {"entries": entries, "referenced_only": referenced_only}

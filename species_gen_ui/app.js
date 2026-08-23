@@ -36,6 +36,12 @@ function initApp() {
                 }
             }
 
+            // Scale bands are edited on the Prefab Builder page, so refresh the
+            // read-only summary whenever the user navigates back.
+            if (typeof renderFamilyScaleSummary === 'function') {
+                renderFamilyScaleSummary();
+            }
+
         });
     });
 
@@ -49,13 +55,21 @@ function initApp() {
     });
 
     // Active Species Input Syncing
-    ['new-name', 'sp-name', 'new-species-id', 'new-genetic-id', 'sp-display-name', 'sp-genus', 'sp-scale', 'sp-variants', 'sp-patterns', 'sp-film-variants', 'sp-asset-category'].forEach(id => {
+    ['new-name', 'sp-name', 'new-species-id', 'new-genetic-id', 'sp-display-name', 'sp-genus', 'sp-scale', 'sp-variants', 'sp-patterns', 'sp-film-variants', 'sp-asset-category', 'chk-scaling'].forEach(id => {
         const el = document.getElementById(id);
         if (el) {
             el.addEventListener('input', saveActiveSpeciesFromUI);
             el.addEventListener('change', saveActiveSpeciesFromUI);
         }
     });
+
+    const scalingCheckbox = document.getElementById('chk-scaling');
+    if (scalingCheckbox) {
+        scalingCheckbox.addEventListener('change', () => {
+            const group = document.getElementById('scale-value-group');
+            if (group) group.style.display = scalingCheckbox.checked ? '' : 'none';
+        });
+    }
 
 
     if (typeof setupDataOverridesPage === 'function') {
@@ -159,17 +173,33 @@ function initApp() {
                 const res = JSON.parse(resStr);
                 if (res.success && res.family) {
                     if (!sp.prefab_overrides) sp.prefab_overrides = {};
-                    res.family.forEach(member => {
-                        let memberKey = "Female";
-                        const lower = member.Name.toLowerCase();
-                        if (lower.includes("_female")) memberKey = "Female";
-                        else if (lower.includes("_male")) memberKey = "Male";
-                        else if (lower.includes("_juvenile")) memberKey = "Juvenile";
+                    const spName = (sp.name || "").trim();
 
-                        sp.prefab_overrides[memberKey] = {
-                            Prefab: member.Prefab,
-                            Properties: member.Props || {}
-                        };
+                    res.family.forEach(member => {
+                        let memberKey = "";
+                        const mName = member.Name || "";
+
+                        if (spName && (mName.toLowerCase() === spName.toLowerCase() || mName.toLowerCase() === (spName + "_female").toLowerCase())) {
+                            memberKey = "Female";
+                        } else if (spName && mName.toLowerCase().startsWith(spName.toLowerCase() + "_")) {
+                            const suffix = mName.substring(spName.length + 1);
+                            const sufLower = suffix.toLowerCase();
+                            if (sufLower === "male") memberKey = "Male";
+                            else if (sufLower === "juvenile") memberKey = "Juvenile";
+                            else memberKey = suffix;
+                        } else {
+                            const lower = mName.toLowerCase();
+                            if (lower.endsWith("_female") || lower === "female") memberKey = "Female";
+                            else if (lower.endsWith("_male") || lower === "male") memberKey = "Male";
+                            else if (lower.endsWith("_juvenile") || lower === "juvenile") memberKey = "Juvenile";
+                        }
+
+                        if (memberKey) {
+                            sp.prefab_overrides[memberKey] = {
+                                Prefab: member.Prefab,
+                                Properties: member.Props || {}
+                            };
+                        }
                     });
                     populatePrefabTabs();
                     backend.show_info(`Loaded existing generated prefabs for '${modProject.mod_name}'!`);
@@ -177,6 +207,7 @@ function initApp() {
                     backend.show_error(res.error || "No generated mod prefabs found.");
                 }
             });
+
         });
     }
 
@@ -225,6 +256,9 @@ function initApp() {
 
                     document.getElementById('mod-name').value = modProject.mod_name || "";
 
+                    const defIconsBox = document.getElementById('chk-default-icons');
+                    if (defIconsBox) defIconsBox.checked = modProject.default_icons === true;
+
                     updateRosterUI();
 
                     if (modProject.species.length > 0) {
@@ -235,7 +269,11 @@ function initApp() {
                     }
 
                     if (modProject.mod_name) {
-                        syncIconsFromMod(modProject.mod_name);
+                        // The project JSON is authoritative. Auto-scanning the
+                        // previously generated folder resurrected stale icon
+                        // packages after a user had deliberately removed every
+                        // icon, turning the feature back on during project load.
+                        renderIconList();
                         syncAssetPackagesFromMod(modProject.mod_name);
                     } else {
                         renderIconList();
@@ -439,6 +477,11 @@ function generateProject() {
     if (!modProject.config) modProject.config = {};
     modProject.config.icons = currentIcons;
 
+    // Mod-level, so it rides on the payload root rather than a species object
+    // (the §5a-2 trap: a setting written only onto a species is ignored).
+    const defIcons = document.getElementById('chk-default-icons');
+    modProject.default_icons = defIcons ? defIcons.checked : false;
+
     const jsonStr = JSON.stringify(modProject);
     backend.generate(jsonStr, (resStr) => {
         try {
@@ -491,6 +534,11 @@ function updateExistingProject() {
     if (!modProject.config) modProject.config = {};
     modProject.config.icons = currentIcons;
 
+    // Mod-level, so it rides on the payload root rather than a species object
+    // (the §5a-2 trap: a setting written only onto a species is ignored).
+    const defIcons = document.getElementById('chk-default-icons');
+    modProject.default_icons = defIcons ? defIcons.checked : false;
+
     const jsonStr = JSON.stringify(modProject);
     backend.generate(jsonStr, (resStr) => {
         try {
@@ -517,4 +565,3 @@ function updateExistingProject() {
         }
     });
 }
-
