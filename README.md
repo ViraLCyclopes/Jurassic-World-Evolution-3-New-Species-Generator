@@ -26,7 +26,7 @@ pip install PyQt5 PyQtWebEngine
 ## 🚀 Quick Start Guide
 
 ### Launching the Application
-- **Option 1 (Double-Click)**: Double-click `Run_Species_Generator.bat`.
+- **Option 1 (Double-Click)**: Double-click `species_gen_ui`.
 - **Option 2 (Terminal)**: Run:
   ```bash
   python species_gen_ui.py
