@@ -76,3 +76,14 @@ If a new game update or custom mod dump releases:
 2. Click **`⚡ Rebuild Prefab Index from Lua Dump`**.
 3. Select your updated `JWE3_Prefabs.lua` file.
 4. The tool will parse and generate a fresh, formatted `prefab_index.json` instantly!
+
+## Documentation
+
+* [docs/CUSTOM_ANIMATIONS.md](docs/CUSTOM_ANIMATIONS.md) - shipping your own
+  motiongraph / OVL instead of borrowing the donor's animations. Read this before
+  renaming a species' animation clips.
+* [docs/ANIMATION_NAME_RESOLUTION.md](docs/ANIMATION_NAME_RESOLUTION.md) -
+  reference: what each animation-name column means, and why fights are the only
+  subsystem that resolves clips through the FDB.
+* [docs/TROUBLESHOOTING_FIGHTS.md](docs/TROUBLESHOOTING_FIGHTS.md) - symptom-first
+  guide for "my species won't fight properly".

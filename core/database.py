@@ -321,8 +321,26 @@ def clone_fdb(source_fdb, target_fdb, donor_species, new_species,
 
         _by_key = {m.get("key"): m for m in resolved_members}
 
-        # Female: own package, else the <Species>_Female convention.
-        donor_female_package = _donor_package(_by_key.get("Female")) or f"{_base_pkg}_Female"
+        # Female: own package, else the <Species>_Female convention - but ONLY
+        # when the donor family actually has more than one member.
+        #
+        # A SEXLESS donor has no <Species>_Female package at all: its assets sit
+        # directly in Dinosaurs/Land/<Species>/ with no Female subfolder, and its
+        # PackageName is NULL precisely because it resolves off the species name.
+        # Inventing "<Species>_Female" points the clone at a package that does
+        # not exist - the same mistake the Male branch below deliberately avoids.
+        #
+        # Measured across the vanilla donors: every 3-member family (Deinosuchus,
+        # Dimetrodon, Triceratops, Velociraptor) has a real *_Female package,
+        # and every 1-member family - all four hybrids: IndominusRex, Indoraptor,
+        # ScorpiosRex, DistortusRex - has NULL and resolves off its own name.
+        # A clone of IndominusRex was getting PackageName='IndominusRex_Female'
+        # and crashing on spawn.
+        _sexless_donor = not (_by_key.get("Male") or _by_key.get("Juvenile"))
+        donor_female_package = (
+            _donor_package(_by_key.get("Female"))
+            or (_base_pkg if _sexless_donor else f"{_base_pkg}_Female")
+        )
 
         # Male: own package when the donor male HAS one (Velociraptor_Male,
         # Triceratops_Male are real, distinct male models), otherwise the
