@@ -110,6 +110,29 @@ def derive_image_name(path, root):
     return image_name_from_disk(rel.replace(os.sep, "/"))
 
 
+def svg_drop_target(path, root, files):
+    """Resolve a replacement without discarding its embedded resource path.
+
+    Exact resource paths win; flat exports may match one unique basename.
+    New or ambiguous entries need a user-selected lookup path.
+    """
+    relative = derive_image_name(path, root)
+    normalise = lambda name: name.replace('\\', '/').casefold()
+    if relative:
+        exact = [name for name, _ in files
+                 if normalise(name) == normalise(relative)]
+        if len(exact) == 1:
+            return exact[0], True
+    basename = normalise(os.path.basename(path))
+    matches = [name for name, _ in files
+               if normalise(name).rsplit('/', 1)[-1] == basename]
+    if len(matches) == 1:
+        return matches[0], True
+    if relative and normalise(relative).startswith('uigameface/'):
+        return relative, False
+    return f'UIGameface/img/icons/dinosaurSpecies/{os.path.basename(path)}', False
+
+
 def describe_kind(name):
     ext = os.path.splitext(name)[1].lower()
     return FILE_KINDS.get(ext, ("Unknown", "not a format seen in vanilla packages"))
@@ -807,12 +830,24 @@ class PPUIPkgTool(QMainWindow):
         for path in svgs:
             with open(path, "rb") as f:
                 data = f.read()
-            name = derive_image_name(path, root)
-            if not name:
-                # Outside the tree: still embeddable, just needs a name.
-                name = f"UIGameface/img/icons/{os.path.basename(path)}"
-            existing = [i for i, (n, _d) in enumerate(self.files) if n == name]
+            name, matched = svg_drop_target(path, root, self.files)
+            if not matched:
+                name, ok = QInputDialog.getText(
+                    self, "SVG entry path",
+                    "No unique existing SVG matched. Enter its full game lookup path:",
+                    text=name)
+                if not ok:
+                    continue
+                name = name.strip().replace('\\', '/')
+                if (not name.casefold().startswith('uigameface/')
+                        or not name.lower().endswith('.svg')
+                        or any(part in ('', '.', '..') for part in name.split('/'))):
+                    problems.append(f"{os.path.basename(path)} - enter a full UIGameface/.../*.svg path")
+                    continue
+            existing = [i for i, (n, _d) in enumerate(self.files)
+                        if n.replace('\\', '/').casefold() == name.casefold()]
             if existing:
+                name = self.files[existing[0]][0]
                 self.files[existing[0]] = (name, data)
                 updated.append(name)
             else:
