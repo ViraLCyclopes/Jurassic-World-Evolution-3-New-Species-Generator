@@ -59,10 +59,19 @@ pip install PyQt5 PyQtWebEngine
 5. **Icon & Package Management (Page 5)**:
    - Manage PPUIPKG icon registrations (`icons.dinosaurSpecies.<Icon>`).
    - Add custom category asset package paths (`+ Add Category Asset Packages`).
+   - Asset-package rows are authoritative: the left field is the exact
+     `.assetpkg` basename and the right field is the emitted asset path and
+     generated directory. Female package guesses follow the actual generated
+     prefab name (for example, `Dynamoterror_Female`).
 
 6. **Review & Build / Update Existing (Page 8)**:
    - **Generate Mod Project**: Build clean new mod files (Lua scripts, FDB databases, Manifest XML, PPUIPKG icons).
    - **Update Existing Mod Files**: Instantly update properties and databases in an existing built mod without rebuilding from scratch.
+   - Builds are created and validated in same-volume staging, then published with
+     rollback protection. Generated Species/Genetic IDs may be allocated up to
+     `99,999,999`, with the complete enabled family reserved as one unit.
+   - Loading project JSON reads supported manual prefab and asset-package edits
+     back from the generated mod before the next update.
 
 7. **Activity & Session Debug Logs (Page 9)**:
    - View real-time user action logs, button clicks, API calls, and system errors.
@@ -87,3 +96,6 @@ If a new game update or custom mod dump releases:
   subsystem that resolves clips through the FDB.
 * [docs/TROUBLESHOOTING_FIGHTS.md](docs/TROUBLESHOOTING_FIGHTS.md) - symptom-first
   guide for "my species won't fight properly".
+* [docs/FIX_IMPLEMENTATION_REPORT.md](docs/FIX_IMPLEMENTATION_REPORT.md) -
+  transactional rebuild, multi-species/ID fixes, editor hardening, and regression
+  verification added in September 2026.

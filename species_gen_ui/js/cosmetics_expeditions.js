@@ -3,6 +3,12 @@
 let editorTable = null;
 let expEditorTable = null;
 let builtMods = [];
+let editorRequestToken = 0;
+let expEditorRequestToken = 0;
+
+function modPathForSelect(mod, selectId) {
+    return selectId === 'exp-mod' ? mod.exp_fdb : (mod.dino_fdb || mod.fdb);
+}
 
 function refreshBuiltMods() {
     backend.list_built_mods((resStr) => {
@@ -39,10 +45,11 @@ function refreshBuiltMods() {
             defaultOpt.textContent = '-- Select a Generated Mod --';
             sel.appendChild(defaultOpt);
 
-            builtMods.forEach((m, i) => {
+            builtMods.forEach((m) => {
                 const o = document.createElement('option');
-                o.value = String(i);
+                o.value = modPathForSelect(m, id) || '';
                 o.textContent = m.name + (id === 'exp-mod' && !m.exp_fdb ? '  (no expeditions FDB)' : '');
+                o.disabled = !o.value;
                 sel.appendChild(o);
             });
 
@@ -65,9 +72,55 @@ function refreshBuiltMods() {
 function selectedMod(selectId) {
     const sel = document.getElementById(selectId);
     if (!sel || sel.value === "" || sel.value === null) return null;
-    const idx = parseInt(sel.value, 10);
-    if (isNaN(idx) || idx < 0 || idx >= builtMods.length) return null;
-    return builtMods[idx] || null;
+    return builtMods.find(m => modPathForSelect(m, selectId) === sel.value) || null;
+}
+
+function setGridSaveEnabled(gridId, enabled) {
+    const id = gridId === 'exp-editor-grid' ? 'btn-exp-editor-save' : 'btn-editor-save';
+    const button = document.getElementById(id);
+    if (button) button.disabled = !enabled;
+}
+
+function invalidateGrid(gridId) {
+    if (gridId === 'exp-editor-grid') {
+        expEditorRequestToken += 1;
+        expEditorTable = null;
+    } else {
+        editorRequestToken += 1;
+        editorTable = null;
+    }
+    setGridSaveEnabled(gridId, false);
+    const container = document.getElementById(gridId);
+    if (container) {
+        container.innerHTML = '<p class="hint">Load the selected table to edit it.</p>';
+    }
+}
+
+function guardGridSelectionChange(gridId, changedSelect) {
+    const tableData = gridId === 'exp-editor-grid' ? expEditorTable : editorTable;
+    if (tableData && tableData.dirty && typeof confirm === 'function' &&
+            !confirm('This grid has unsaved edits. Discard them and change selection?')) {
+        if (changedSelect.id === 'editor-mod' || changedSelect.id === 'exp-mod') {
+            changedSelect.value = tableData.databasePath;
+        } else {
+            changedSelect.value = tableData.tableName;
+        }
+        return false;
+    }
+    invalidateGrid(gridId);
+    return true;
+}
+
+function syncGridModel(gridId) {
+    const tableData = gridId === 'exp-editor-grid' ? expEditorTable : editorTable;
+    const container = document.getElementById(gridId);
+    if (!tableData || !container) return;
+    const rows = [];
+    container.querySelectorAll('tbody tr[data-row-idx]').forEach(tr => {
+        rows.push(Array.from(tr.querySelectorAll('input')).map(input =>
+            input.value === '' ? null : input.value));
+    });
+    tableData.rows = rows;
 }
 
 
@@ -77,42 +130,45 @@ function setupEditorPage() {
     const add = document.getElementById('btn-editor-addrow');
     if (!load) return;
 
+    const modSelect = document.getElementById('editor-mod');
+    const tableSelect = document.getElementById('editor-table');
+    [modSelect, tableSelect].forEach(select => {
+        if (select) select.addEventListener('change', () =>
+            guardGridSelectionChange('editor-grid', select));
+    });
+    setGridSaveEnabled('editor-grid', false);
+
     load.onclick = () => {
         if (typeof logButtonClick === 'function') logButtonClick('btn-editor-load', 'Load Mod Table');
         const mod = selectedMod('editor-mod');
         if (!mod) { backend.show_error("Pick a generated mod first."); return; }
         const table = document.getElementById('editor-table').value;
         const fdbPath = mod.dino_fdb || mod.fdb;
+        invalidateGrid('editor-grid');
+        const token = ++editorRequestToken;
         backend.load_mod_table(fdbPath, table, (resStr) => {
             const res = JSON.parse(resStr);
-            if (!res.success) { backend.show_error(res.error); return; }
-            editorTable = res.data;
+            if (token !== editorRequestToken) return;
+            if (!res.success) {
+                invalidateGrid('editor-grid');
+                backend.show_error(res.error);
+                return;
+            }
+            editorTable = Object.assign({}, res.data, {
+                databasePath: fdbPath, tableName: table, requestToken: token, dirty: false
+            });
             renderEditorGrid(editorTable, 'editor-grid');
+            setGridSaveEnabled('editor-grid', true);
             checkEditorProblems(fdbPath);
         });
     };
 
     save.onclick = () => {
         if (typeof logButtonClick === 'function') logButtonClick('btn-editor-save', 'Save Mod Table');
-        const mod = selectedMod('editor-mod');
-        if (!mod || !editorTable) return;
-        const table = document.getElementById('editor-table').value;
-        const fdbPath = mod.dino_fdb || mod.fdb;
-
-        const container = document.getElementById('editor-grid');
-        const trs = container.querySelectorAll('tbody tr');
-        const newRows = [];
-        for (let i = 0; i < trs.length; i++) {
-            const inputs = trs[i].querySelectorAll('input');
-            const row = [];
-            for (let j = 0; j < inputs.length; j++) {
-                const val = inputs[j].value;
-                row.push(val === '' ? null : val);
-            }
-            newRows.push(row);
-        }
-        editorTable.rows = newRows;
-
+        if (!editorTable) return;
+        syncGridModel('editor-grid');
+        const fdbPath = editorTable.databasePath;
+        const table = editorTable.tableName;
         backend.save_mod_table(fdbPath, table, JSON.stringify(editorTable), (resStr) => {
             const res = JSON.parse(resStr);
             if (!res.success) {
@@ -120,6 +176,7 @@ function setupEditorPage() {
                 return;
             }
             showEditorProblems(res.problems || []);
+            editorTable.dirty = false;
             alert(`Saved ${res.written} rows to ${table}.`);
         });
     };
@@ -128,8 +185,10 @@ function setupEditorPage() {
     add.onclick = () => {
         if (typeof logButtonClick === 'function') logButtonClick('btn-editor-addrow', 'Add Row to Mod Table');
         if (!editorTable) return;
+        syncGridModel('editor-grid');
         const emptyRow = editorTable.columns.map(() => null);
         editorTable.rows.push(emptyRow);
+        editorTable.dirty = true;
         renderEditorGrid(editorTable, 'editor-grid');
     };
 }
@@ -153,7 +212,7 @@ function renderEditorGrid(tableData = editorTable, gridId = 'editor-grid') {
             html += `<tr data-row-idx="${rIdx}">`;
             tableData.columns.forEach((col, cIdx) => {
                 const val = row[cIdx] !== null && row[cIdx] !== undefined ? String(row[cIdx]) : "";
-                html += `<td style="padding: 4px; border: 1px solid rgba(255,255,255,0.06);"><input type="text" class="form-control prop-grid-input" value="${val.replace(/"/g, '&quot;')}" style="width: 100%; padding: 4px 8px; font-size: 0.85rem; border-radius: 3px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.2); color: #e0e6ed;"></td>`;
+                html += `<td style="padding: 4px; border: 1px solid rgba(255,255,255,0.06);"><input type="text" class="form-control prop-grid-input" value="${escapeEditorHtml(val)}" data-col-idx="${cIdx}" style="width: 100%; padding: 4px 8px; font-size: 0.85rem; border-radius: 3px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.2); color: #e0e6ed;"></td>`;
             });
             html += `<td style="padding: 4px; text-align: center; border: 1px solid rgba(255,255,255,0.06);"><button class="btn-icon btn-del-grid-row" onclick="deleteEditorRow('${gridId}', ${rIdx})" style="color: #ff6060; cursor: pointer; border: none; background: transparent;">✕</button></td>`;
             html += '</tr>';
@@ -165,7 +224,24 @@ function renderEditorGrid(tableData = editorTable, gridId = 'editor-grid') {
     container.innerHTML = html;
 
     const tableEl = document.getElementById(`${gridId}-table`);
-    if (tableEl) initTableResizers(tableEl);
+    if (tableEl) {
+        initTableResizers(tableEl);
+        tableEl.querySelectorAll('tbody input').forEach(input => {
+            input.addEventListener('input', () => {
+                const target = gridId === 'exp-editor-grid' ? expEditorTable : editorTable;
+                if (!target) return;
+                const rowIndex = parseInt(input.closest('tr').dataset.rowIdx, 10);
+                const colIndex = parseInt(input.dataset.colIdx, 10);
+                target.rows[rowIndex][colIndex] = input.value === '' ? null : input.value;
+                target.dirty = true;
+            });
+        });
+    }
+}
+
+function escapeEditorHtml(value) {
+    return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function initTableResizers(table) {
@@ -204,7 +280,9 @@ function initTableResizers(table) {
 function deleteEditorRow(gridId, rIdx) {
     const tableData = gridId === 'exp-editor-grid' ? expEditorTable : editorTable;
     if (!tableData || !tableData.rows) return;
+    syncGridModel(gridId);
     tableData.rows.splice(rIdx, 1);
+    tableData.dirty = true;
     renderEditorGrid(tableData, gridId);
 }
 
@@ -247,8 +325,18 @@ function setupExpeditionsPage() {
     }
 
     if (expModSel) {
-        expModSel.onchange = loadExistingDigsites;
+        expModSel.onchange = () => {
+            if (guardGridSelectionChange('exp-editor-grid', expModSel)) {
+                loadExistingDigsites();
+            }
+        };
     }
+    const expTableSel = document.getElementById('exp-table-select');
+    if (expTableSel) {
+        expTableSel.onchange = () =>
+            guardGridSelectionChange('exp-editor-grid', expTableSel);
+    }
+    setGridSaveEnabled('exp-editor-grid', false);
 
     if (btn) {
         btn.onclick = () => {
@@ -352,6 +440,7 @@ function loadExistingDigsites() {
     const tableSelect = document.getElementById('exp-table-select');
 
     if (!mod || !mod.exp_fdb) {
+        invalidateGrid('exp-editor-grid');
         if (listEl) listEl.innerHTML = '<p class="hint">Select a generated mod with an expeditions FDB first.</p>';
         const grid = document.getElementById('exp-editor-grid');
         if (grid) grid.innerHTML = '<p class="hint">Select a generated mod with an expeditions FDB first.</p>';
@@ -409,15 +498,23 @@ function loadExistingDigsites() {
     // 2. Load Selected Expeditions Table into Editor Grid
     if (tableSelect) {
         const table = tableSelect.value;
+        invalidateGrid('exp-editor-grid');
+        const token = ++expEditorRequestToken;
+        const fdbPath = mod.exp_fdb;
         backend.load_mod_table(mod.exp_fdb, table, (resStr) => {
             const res = JSON.parse(resStr);
+            if (token !== expEditorRequestToken) return;
             if (!res.success) {
+                invalidateGrid('exp-editor-grid');
                 const grid = document.getElementById('exp-editor-grid');
                 if (grid) grid.innerHTML = `<p class="hint">${res.error}</p>`;
                 return;
             }
-            expEditorTable = res.data;
+            expEditorTable = Object.assign({}, res.data, {
+                databasePath: fdbPath, tableName: table, requestToken: token, dirty: false
+            });
             renderEditorGrid(expEditorTable, 'exp-editor-grid');
+            setGridSaveEnabled('exp-editor-grid', true);
         });
     }
 }
@@ -431,8 +528,10 @@ function addExpeditionRow() {
         backend.show_error("Load an Expeditions table first.");
         return;
     }
+    syncGridModel('exp-editor-grid');
     const emptyRow = expEditorTable.columns.map(() => null);
     expEditorTable.rows.push(emptyRow);
+    expEditorTable.dirty = true;
     renderEditorGrid(expEditorTable, 'exp-editor-grid');
 }
 
@@ -441,32 +540,33 @@ function saveExpeditionTable() {
         backend.show_error("Load an Expeditions table first.");
         return;
     }
-    const mod = selectedMod('exp-mod');
-    if (!mod || !mod.exp_fdb) {
-        backend.show_error("Select a mod with an expeditions FDB first.");
-        return;
-    }
-    const table = document.getElementById('exp-table-select').value;
-    const container = document.getElementById('exp-editor-grid');
-    const trs = container.querySelectorAll('tbody tr');
-    const newRows = [];
-    for (let i = 0; i < trs.length; i++) {
-        const inputs = trs[i].querySelectorAll('input');
-        const row = [];
-        for (let j = 0; j < inputs.length; j++) {
-            const val = inputs[j].value;
-            row.push(val === '' ? null : val);
-        }
-        newRows.push(row);
-    }
-    expEditorTable.rows = newRows;
-
-    backend.save_mod_table(mod.exp_fdb, table, JSON.stringify(expEditorTable), (resStr) => {
+    syncGridModel('exp-editor-grid');
+    const table = expEditorTable.tableName;
+    const fdbPath = expEditorTable.databasePath;
+    const newRows = expEditorTable.rows;
+    backend.save_mod_table(fdbPath, table, JSON.stringify(expEditorTable), (resStr) => {
         const res = JSON.parse(resStr);
         if (!res.success) {
             backend.show_error(res.error);
             return;
         }
+        expEditorTable.dirty = false;
         alert(`Saved ${res.written || newRows.length} rows to ${table}.`);
     });
+}
+
+// Small CommonJS surface for the headless regression harness. Browsers ignore
+// this block; production state remains owned by this file.
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        setupEditorPage,
+        selectedMod,
+        deleteEditorRow,
+        escapeEditorHtml,
+        _setBuiltMods: value => { builtMods = value; },
+        _setEditorTable: value => { editorTable = value; },
+        _setExpEditorTable: value => { expEditorTable = value; },
+        _getEditorTable: () => editorTable,
+        _getExpEditorTable: () => expEditorTable,
+    };
 }

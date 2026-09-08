@@ -21,6 +21,7 @@ function renderAssetPackages() {
     }
 
     pkgKeys.forEach(pkgName => {
+        let currentKey = pkgName;
         const template = document.getElementById('tpl-asset-package-item');
         let clone;
         if (template && template.content) {
@@ -49,19 +50,21 @@ function renderAssetPackages() {
         pathInput.value = packages[pkgName];
 
         nameInput.addEventListener('input', () => {
-            const oldVal = packages[pkgName];
-            delete packages[pkgName];
+            const oldVal = Object.prototype.hasOwnProperty.call(packages, currentKey)
+                ? packages[currentKey]
+                : pathInput.value.trim();
+            if (currentKey) delete packages[currentKey];
             const newName = nameInput.value.trim();
             if (newName) packages[newName] = oldVal;
+            currentKey = newName;
         });
 
         pathInput.addEventListener('input', () => {
-            const key = nameInput.value.trim();
-            if (key) packages[key] = pathInput.value.trim();
+            if (currentKey) packages[currentKey] = pathInput.value.trim();
         });
 
         removeBtn.addEventListener('click', () => {
-            delete packages[pkgName];
+            if (currentKey) delete packages[currentKey];
             renderAssetPackages();
         });
 

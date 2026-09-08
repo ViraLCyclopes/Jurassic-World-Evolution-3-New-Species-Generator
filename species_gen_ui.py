@@ -8,7 +8,7 @@ import re
 
 os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu --disable-software-rasterizer --disable-gpu-compositing"
 
-from PyQt5.QtCore import QObject, pyqtSlot, QUrl, Qt
+from PyQt5.QtCore import QObject, pyqtSlot, pyqtSignal, QUrl, Qt, QThread
 from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
 from PyQt5.QtWebChannel import QWebChannel
@@ -17,12 +17,37 @@ import species_gen
 from core import logger, ppuipkg_manager, fdb_cloner, expeditions
 
 
+class GenerationWorker(QObject):
+    finished = pyqtSignal(str)
+
+    def __init__(self, generate_fn, payload, request_type):
+        super().__init__()
+        self.generate_fn = generate_fn
+        self.payload = payload
+        self.request_type = request_type
+
+    @pyqtSlot()
+    def run(self):
+        result = self.generate_fn(self.payload)
+        try:
+            parsed = json.loads(result)
+            parsed["request_type"] = self.request_type
+            result = json.dumps(parsed)
+        except Exception:
+            pass
+        self.finished.emit(result)
+
+
 class SpeciesGenBackend(QObject):
     """Exposed to JS as 'backend' via QWebChannel"""
+
+    generationFinished = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.window = parent
+        self._generation_thread = None
+        self._generation_worker = None
 
     @pyqtSlot(str, str, str)
     def log_activity(self, level, category, message):
@@ -113,8 +138,8 @@ class SpeciesGenBackend(QObject):
             return json.dumps({"success": False, "error": str(e)})
 
 
-    @pyqtSlot(str, result=str)
-    def generate(self, payload_json_str):
+    def _generate_sync(self, payload_json_str):
+        payload = None
         try:
             payload = json.loads(payload_json_str)
             mod_name = payload.get("mod_name")
@@ -123,11 +148,36 @@ class SpeciesGenBackend(QObject):
             if not mod_name or not species_configs:
                 return json.dumps({"success": False, "error": "mod_name and at least one species are required"})
 
-            species_gen.allocate_species_ids(species_configs)
+            source_fdb = payload.get("source_dinosaurs_fdb") or species_gen.DEFAULT_SOURCE_FDB
+            species_gen.allocate_species_ids(species_configs, source_fdb)
 
             plans = []
 
             combined_report = {"warnings": [], "tables": {}, "exp_tables": {}}
+
+            # The editable Asset Packages table lives under project.config.
+            # Treat it as authoritative when present: older top-level and
+            # per-species copies may be stale after a user renames a package or
+            # edits its path in the table.
+            ui_config = payload.get("config")
+            if not isinstance(ui_config, dict):
+                ui_config = {}
+                payload["config"] = ui_config
+            if "asset_packages" in ui_config:
+                if not isinstance(ui_config["asset_packages"], dict):
+                    raise ValueError("config.asset_packages must be an object mapping package names to paths")
+                root_ap = dict(ui_config["asset_packages"])
+            else:
+                root_ap = {}
+                for species_config in species_configs:
+                    legacy_packages = species_config.get("asset_packages")
+                    if isinstance(legacy_packages, dict):
+                        root_ap.update(legacy_packages)
+                legacy_root = payload.get("asset_packages")
+                if isinstance(legacy_root, dict):
+                    root_ap.update(legacy_root)
+            payload["asset_packages"] = root_ap
+            ui_config["asset_packages"] = dict(root_ap)
 
             # GUI projects use an explicit per-species feature gate. Rebuild
             # this map so stale scale data from an older saved project cannot
@@ -135,19 +185,13 @@ class SpeciesGenBackend(QObject):
             if any("scaling_enabled" in c for c in species_configs):
                 payload["scaling"] = {}
             
-            root_ap = payload.get("asset_packages") or {}
             for config in species_configs:
-                if root_ap:
-                    if not config.get("asset_packages"): config["asset_packages"] = {}
-                    config["asset_packages"].update(root_ap)
                 plan, report = species_gen.plan_species(config)
                 plans.append({"config": config, **plan})
 
                 if config.get("scaling_enabled") is True and config.get("scaling"):
                     payload.setdefault("scaling", {}).update(config["scaling"])
 
-                if config.get("asset_packages"):
-                    payload.setdefault("asset_packages", {}).update(config["asset_packages"])
                 if config.get("asset_category") and not payload.get("asset_category"):
                     payload["asset_category"] = config["asset_category"]
                 # asset_package_inheritance is resolved per family member inside
@@ -164,36 +208,75 @@ class SpeciesGenBackend(QObject):
                     combined_report["warnings"].extend(report["warnings"])
                 
             paths = species_gen.generate_species(mod_name, plans, combined_report, payload)
-            
-            proj_path = os.path.join(species_gen.BASE, "Generated", mod_name, "mod_project.json")
-            os.makedirs(os.path.dirname(proj_path), exist_ok=True)
-            with open(proj_path, "w", encoding="utf-8") as f:
-                f.write(json.dumps(payload, indent=2))
-            paths["project_file"] = proj_path
 
             gc.collect()
 
             log_path = os.path.join(species_gen.BASE, "Generated", "species_gen_log.txt")
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            with open(log_path, "w", encoding="utf-8") as f:
-                f.write("=== SUCCESS ===\n")
-                f.write(json.dumps(combined_report, indent=2))
+            try:
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                with open(log_path, "w", encoding="utf-8") as f:
+                    f.write("=== SUCCESS ===\n")
+                    f.write(json.dumps(combined_report, indent=2))
+            except Exception as log_exc:
+                combined_report.setdefault("warnings", []).append(
+                    f"Build published successfully, but the activity log could not be written: {log_exc}")
 
-            return json.dumps({"success": True, "paths": paths, "report": combined_report})
+            return json.dumps({
+                "success": True, "paths": paths, "report": combined_report,
+                "project": payload,
+            })
         except Exception as e:
             import traceback
             traceback.print_exc()
             
-            log_path = os.path.join(species_gen.BASE, "Generated", "species_gen_log.txt")
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            with open(log_path, "w", encoding="utf-8") as f:
-                f.write("=== ERROR ===\n")
-                f.write(str(e) + "\n\n")
-                f.write(traceback.format_exc())
-                f.write("\n\n=== PAYLOAD ===\n")
-                f.write(json.dumps(payload, indent=2) if payload else "None")
+            try:
+                log_path = os.path.join(species_gen.BASE, "Generated", "species_gen_log.txt")
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                with open(log_path, "w", encoding="utf-8") as f:
+                    f.write("=== ERROR ===\n")
+                    f.write(str(e) + "\n\n")
+                    f.write(traceback.format_exc())
+                    f.write("\n\n=== PAYLOAD ===\n")
+                    f.write(json.dumps(payload, indent=2) if payload else "None")
+            except Exception:
+                pass
                 
             return json.dumps({"success": False, "error": str(e)})
+
+    @pyqtSlot(str, result=str)
+    def generate(self, payload_json_str):
+        """Synchronous compatibility entry point; the GUI uses start_generate."""
+        return self._generate_sync(payload_json_str)
+
+    @pyqtSlot(str, str, result=str)
+    def start_generate(self, payload_json_str, request_type="generate"):
+        if self._generation_thread is not None:
+            return json.dumps({"accepted": False, "error": "A generation job is already running."})
+        thread = QThread(self)
+        worker = GenerationWorker(self._generate_sync, payload_json_str, request_type)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(self._generation_complete)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._generation_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._generation_thread = thread
+        self._generation_worker = worker
+        thread.start()
+        return json.dumps({"accepted": True})
+
+    @pyqtSlot(str)
+    def _generation_complete(self, result):
+        self.generationFinished.emit(result)
+
+    @pyqtSlot()
+    def _generation_thread_finished(self):
+        self._generation_worker = None
+        self._generation_thread = None
+
+    def generation_running(self):
+        return self._generation_thread is not None
 
     # ---------------- post-build editing ----------------
 
@@ -363,6 +446,15 @@ class MainWindow(QMainWindow):
 
         ui_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "species_gen_ui", "index.html"))
         self.browser.load(QUrl.fromLocalFile(ui_path))
+
+    def closeEvent(self, event):
+        if self.backend.generation_running():
+            QMessageBox.information(
+                self, "Generation in progress",
+                "The project is still being generated and published. Wait for it to finish before closing.")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 
 def main():

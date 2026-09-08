@@ -6,9 +6,136 @@ function logButtonClick(btnId, actionName) {
     }
 }
 
+let pendingGenerationMode = null;
+
+function setGenerationControlsEnabled(enabled) {
+    ['btn-generate', 'btn-build-mod', 'btn-update-existing', 'btn-update-mod'].forEach(id => {
+        const button = document.getElementById(id);
+        if (button) button.disabled = !enabled;
+    });
+}
+
+function adoptNormalizedProject(project) {
+    if (!project) return;
+    modProject = project;
+    updateRosterUI();
+    if (currentSpeciesIndex >= 0 && modProject.species[currentSpeciesIndex]) {
+        loadSpeciesIntoUI(modProject.species[currentSpeciesIndex]);
+    }
+}
+
+function handleGenerationFinished(resStr) {
+    setGenerationControlsEnabled(true);
+    pendingGenerationMode = null;
+    try {
+        const res = JSON.parse(resStr);
+        const mode = res.request_type || 'generate';
+        const card = document.getElementById('build-results-card');
+        const box = document.getElementById('build-results-content');
+        if (card) card.style.display = 'block';
+        if (!res.success) {
+            if (box) box.textContent = `=== ${mode === 'update' ? 'UPDATE' : 'GENERATION'} FAILED ===\n\nError: ${res.error || 'Unknown error'}`;
+            backend.show_error(res.error || 'Generation failed.');
+            backend.log_activity('ERROR', 'BUILD', `Failed to ${mode} mod: ${res.error}`);
+            return;
+        }
+        adoptNormalizedProject(res.project);
+        if (mode === 'update') {
+            renderAssetPackages();
+            renderIconList();
+            if (box) box.textContent = `Updated mod files for '${modProject.mod_name}' successfully!`;
+            backend.show_info(`Updated existing files for '${modProject.mod_name}'!`);
+        } else {
+            let output = `=== MOD GENERATED SUCCESSFULLY ===\n\nMod Name: ${modProject.mod_name}\nGenerated Files:\n`;
+            Object.keys(res.paths || {}).forEach(key => output += ` - ${key}: ${res.paths[key]}\n`);
+            if (res.report && res.report.warnings && res.report.warnings.length) {
+                output += '\nWarnings:\n';
+                res.report.warnings.forEach(w => output += ` ⚠️ ${w}\n`);
+            }
+            if (box) box.textContent = output;
+            backend.show_info(`Mod '${modProject.mod_name}' generated successfully!`);
+        }
+        backend.log_activity('INFO', 'BUILD', `Successfully ${mode === 'update' ? 'updated' : 'generated'} mod '${modProject.mod_name}'.`);
+    } catch (error) {
+        backend.show_error('Failed to parse generation response: ' + error.message);
+    }
+}
+
+function startGenerationRequest(jsonStr, mode) {
+    if (pendingGenerationMode) return;
+    pendingGenerationMode = mode;
+    setGenerationControlsEnabled(false);
+    backend.start_generate(jsonStr, mode, (ackStr) => {
+        try {
+            const ack = JSON.parse(ackStr);
+            if (ack.accepted) return;
+            pendingGenerationMode = null;
+            setGenerationControlsEnabled(true);
+            backend.show_error(ack.error || 'Could not start generation.');
+        } catch (error) {
+            pendingGenerationMode = null;
+            setGenerationControlsEnabled(true);
+            backend.show_error('Could not start generation: ' + error.message);
+        }
+    });
+}
+
+function mergeGeneratedPrefabsIntoProject(family) {
+    if (!Array.isArray(family) || !Array.isArray(modProject.species)) return 0;
+    let merged = 0;
+    const speciesByLength = modProject.species.slice().sort(
+        (a, b) => String(b.name || '').length - String(a.name || '').length);
+    family.forEach(member => {
+        const memberName = String(member.Name || '');
+        const lower = memberName.toLowerCase();
+        const sp = speciesByLength.find(candidate => {
+            const base = String(candidate.name || '').toLowerCase();
+            return base && (lower === base || lower === `${base}_female` ||
+                lower === `${base}_male` || lower === `${base}_juvenile`);
+        });
+        if (!sp) return;
+        const base = String(sp.name).toLowerCase();
+        let key = 'Female';
+        if (lower === `${base}_male`) key = 'Male';
+        else if (lower === `${base}_juvenile`) key = 'Juvenile';
+        if (!sp.prefab_overrides) sp.prefab_overrides = {};
+        sp.prefab_overrides[key] = {
+            Prefab: member.Prefab,
+            Properties: member.Props || {},
+        };
+        merged += 1;
+    });
+    return merged;
+}
+
+function generatedFemalePackageName(sp) {
+    const speciesName = String((sp && sp.name) || "Species");
+    const donorPrefabs = (sp && sp.donor_prefabs) || {};
+    const femaleDonor = String(donorPrefabs.Female || (sp && sp.source) || "");
+    const source = String((sp && sp.source) || "");
+    return femaleDonor.toLowerCase().endsWith('_female') || source.toLowerCase().endsWith('_female')
+        ? `${speciesName}_Female`
+        : speciesName;
+}
+
+function buildCategoryAssetPackages(modName, category, sp) {
+    const speciesName = String((sp && sp.name) || "Species");
+    const femaleName = generatedFemalePackageName(sp);
+    const maleName = `${speciesName}_Male`;
+    const juvenileName = `${speciesName}_Juvenile`;
+    return {
+        [femaleName]: `ovldata\\${modName}\\Dinosaurs\\${category}\\${speciesName}\\Female\\${femaleName}`,
+        [maleName]: `ovldata\\${modName}\\Dinosaurs\\${category}\\${speciesName}\\Male\\${maleName}`,
+        [juvenileName]: `ovldata\\${modName}\\Dinosaurs\\${category}\\${speciesName}\\Juvenile\\${juvenileName}`,
+    };
+}
+
 document.addEventListener("DOMContentLoaded", () => {
     new QWebChannel(qt.webChannelTransport, (channel) => {
         window.backend = channel.objects.backend;
+        if (backend.generationFinished && backend.generationFinished.connect) {
+            backend.generationFinished.connect(handleGenerationFinished);
+        }
         initApp();
     });
 });
@@ -269,18 +396,26 @@ function initApp() {
                     }
 
                     if (modProject.mod_name) {
-                        // The project JSON is authoritative. Auto-scanning the
-                        // previously generated folder resurrected stale icon
-                        // packages after a user had deliberately removed every
-                        // icon, turning the feature back on during project load.
+                        // JSON is the baseline; supported generated artifacts
+                        // are read back so deliberate edits made outside the
+                        // GUI are not silently reverted on the next build.
                         renderIconList();
                         syncAssetPackagesFromMod(modProject.mod_name);
+                        backend.load_generated_mod_prefabs(modProject.mod_name, (prefabStr) => {
+                            const prefabRes = JSON.parse(prefabStr);
+                            const merged = prefabRes.success
+                                ? mergeGeneratedPrefabsIntoProject(prefabRes.family) : 0;
+                            updateRosterUI();
+                            if (currentSpeciesIndex >= 0 && modProject.species[currentSpeciesIndex]) {
+                                loadSpeciesIntoUI(modProject.species[currentSpeciesIndex]);
+                            }
+                            backend.show_info(`Project '${modProject.mod_name || "Mod"}' loaded successfully${merged ? `; imported ${merged} edited prefab file(s)` : ''}!`);
+                        });
                     } else {
                         renderIconList();
                         renderAssetPackages();
+                        backend.show_info(`Project '${modProject.mod_name || "Mod"}' loaded successfully!`);
                     }
-
-                    backend.show_info(`Project '${modProject.mod_name || "Mod"}' loaded successfully!`);
                     backend.log_activity("INFO", "PROJECT", `Loaded project JSON '${modProject.mod_name || "Mod"}' containing ${modProject.species.length} species.`);
                 } catch (err) {
                     backend.show_error("Failed to parse project JSON: " + err.message);
@@ -336,20 +471,19 @@ function initApp() {
 
             const pkgs = modProject.config.asset_packages;
 
-            const femaleKey = spName;
-            const maleKey = `${spName}_Male`;
-            const juvKey = `${spName}_Juvenile`;
-
-            pkgs[femaleKey] = `ovldata\\${modName}\\Dinosaurs\\${category}\\${spName}\\Female\\${spName}`;
-            pkgs[maleKey] = `ovldata\\${modName}\\Dinosaurs\\${category}\\${spName}\\Male\\${maleKey}`;
-            pkgs[juvKey] = `ovldata\\${modName}\\Dinosaurs\\${category}\\${spName}\\Juvenile\\${juvKey}`;
+            const generatedPackages = buildCategoryAssetPackages(modName, category, sp || {name: spName});
+            const femaleKey = generatedFemalePackageName(sp || {name: spName});
+            const legacyFemalePath = `ovldata\\${modName}\\Dinosaurs\\${category}\\${spName}\\Female\\${spName}`;
+            if (femaleKey !== spName && pkgs[spName] === legacyFemalePath) delete pkgs[spName];
+            Object.assign(pkgs, generatedPackages);
 
             if (sp) {
                 sp.asset_category = category;
                 if (!sp.asset_packages) sp.asset_packages = {};
-                sp.asset_packages[femaleKey] = pkgs[femaleKey];
-                sp.asset_packages[maleKey] = pkgs[maleKey];
-                sp.asset_packages[juvKey] = pkgs[juvKey];
+                if (femaleKey !== spName && sp.asset_packages[spName] === legacyFemalePath) {
+                    delete sp.asset_packages[spName];
+                }
+                Object.assign(sp.asset_packages, generatedPackages);
             }
 
             renderAssetPackages();
@@ -368,9 +502,8 @@ function initApp() {
                 const preview = document.getElementById('asset-path-preview');
                 if (preview) {
                     const modName = modProject.mod_name || "MyMod";
-                    const spName = sp.name || "Species";
-                    const cat = sp.asset_category ? sp.asset_category + "\\" : "";
-                    preview.textContent = sp.asset_category ? `ovldata\\${modName}\\Dinosaurs\\${cat}${spName}\\Female\\${spName}` : '—';
+                    const packages = buildCategoryAssetPackages(modName, sp.asset_category, sp);
+                    preview.textContent = sp.asset_category ? packages[generatedFemalePackageName(sp)] : '—';
                 }
             }
         });
@@ -483,6 +616,8 @@ function generateProject() {
     modProject.default_icons = defIcons ? defIcons.checked : false;
 
     const jsonStr = JSON.stringify(modProject);
+    startGenerationRequest(jsonStr, 'generate');
+    /* Legacy synchronous response path retained here only for reference.
     backend.generate(jsonStr, (resStr) => {
         try {
             const res = JSON.parse(resStr);
@@ -491,6 +626,13 @@ function generateProject() {
             if (resCard) resCard.style.display = 'block';
 
             if (res.success) {
+                if (res.project) {
+                    modProject = res.project;
+                    updateRosterUI();
+                    if (currentSpeciesIndex >= 0 && modProject.species[currentSpeciesIndex]) {
+                        loadSpeciesIntoUI(modProject.species[currentSpeciesIndex]);
+                    }
+                }
                 let outText = `=== MOD GENERATED SUCCESSFULLY ===\n\n`;
                 outText += `Mod Name: ${modProject.mod_name}\n`;
                 outText += `Generated Files:\n`;
@@ -514,7 +656,7 @@ function generateProject() {
         } catch (err) {
             backend.show_error("Failed to parse generation response: " + err.message);
         }
-    });
+    }); */
 }
 
 function updateExistingProject() {
@@ -540,6 +682,8 @@ function updateExistingProject() {
     modProject.default_icons = defIcons ? defIcons.checked : false;
 
     const jsonStr = JSON.stringify(modProject);
+    startGenerationRequest(jsonStr, 'update');
+    /* Legacy synchronous response path retained here only for reference.
     backend.generate(jsonStr, (resStr) => {
         try {
             const res = JSON.parse(resStr);
@@ -548,6 +692,13 @@ function updateExistingProject() {
             if (card) card.style.display = 'block';
 
             if (res.success) {
+                if (res.project) {
+                    modProject = res.project;
+                    updateRosterUI();
+                    if (currentSpeciesIndex >= 0 && modProject.species[currentSpeciesIndex]) {
+                        loadSpeciesIntoUI(modProject.species[currentSpeciesIndex]);
+                    }
+                }
                 renderAssetPackages();
                 renderIconList();
                 if (content) {
@@ -563,5 +714,13 @@ function updateExistingProject() {
         } catch (e) {
             backend.show_error("Failed to parse update response: " + e.message);
         }
-    });
+    }); */
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        mergeGeneratedPrefabsIntoProject,
+        generatedFemalePackageName,
+        buildCategoryAssetPackages,
+    };
 }

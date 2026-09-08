@@ -3,6 +3,9 @@ import re
 import shutil
 import uuid as uuid_mod
 import sqlite3
+import json
+import tempfile
+import hashlib
 
 from core.templates import (
     BASE_DIR, PREFAB_LUA, COSMETIC_LUA, PREFABDATA_LUA,
@@ -14,7 +17,93 @@ from core.templates import (
     DEFAULT_SPECIES_STATS, DEFAULT_GENOMES, DEFAULT_SPECIALISATION,
     DEFAULT_EXPEDITIONS, DEFAULT_BUILDING_UPGRADES
 )
-from core.database import clone_fdb, clone_expeditions_fdb, ensure_table
+from core.database import (
+    clone_fdb, clone_expeditions_fdb, ensure_table, allocate_species_ids,
+    resolve_family_members,
+)
+
+
+IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+OWNERSHIP_FILE = ".species_generator_files.json"
+
+
+def validate_output_identifier(value, label):
+    """Validate an identifier used as both Lua symbol and Windows basename."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} is required")
+    if value != value.strip() or value.endswith((".", " ")):
+        raise ValueError(f"{label} cannot have leading/trailing spaces or dots")
+    if os.path.isabs(value) or "/" in value or "\\" in value or ".." in value:
+        raise ValueError(f"{label} cannot contain a path, separators, or traversal")
+    if not IDENTIFIER_RE.fullmatch(value):
+        raise ValueError(
+            f"{label} must start with a letter and contain only letters, digits, and underscores")
+    if value.split(".", 1)[0].upper() in WINDOWS_RESERVED:
+        raise ValueError(f"{label} uses reserved Windows basename {value!r}")
+    return value
+
+
+def _exact_case_output_path(parent, filename):
+    """Return an output path and migrate an older case-only spelling."""
+    desired = os.path.join(parent, filename)
+    if not os.path.isdir(parent):
+        return desired
+    match = next((entry for entry in os.listdir(parent)
+                  if entry.casefold() == filename.casefold()), None)
+    if match is None or match == filename:
+        return desired
+    existing = os.path.join(parent, match)
+    temporary = os.path.join(parent, f".{filename}.case-{uuid_mod.uuid4().hex}")
+    os.replace(existing, temporary)
+    os.replace(temporary, desired)
+    return desired
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _assert_tree_safe(root):
+    """Reject symlink/junction escapes before copying, writing, or cleanup."""
+    if not os.path.exists(root):
+        return
+    def is_reparse(path):
+        attrs = getattr(os.stat(path, follow_symlinks=False), "st_file_attributes", 0)
+        return bool(attrs & getattr(__import__("stat"), "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    if os.path.islink(root) or is_reparse(root):
+        raise RuntimeError(f"Refusing generated project rooted at a link/reparse point: {root}")
+    root_real = os.path.realpath(root)
+    for current, dirs, files in os.walk(root):
+        for name in dirs + files:
+            path = os.path.join(current, name)
+            if os.path.islink(path) or is_reparse(path) or os.path.commonpath(
+                    [root_real, os.path.realpath(path)]) != root_real:
+                raise RuntimeError(f"Refusing generated project containing link/reparse escape: {path}")
+
+
+def _safe_rmtree(path, parent):
+    path_real = os.path.realpath(path)
+    parent_real = os.path.realpath(parent)
+    if os.path.commonpath([path_real, parent_real]) != parent_real or path_real == parent_real:
+        raise RuntimeError(f"Refusing unsafe cleanup outside staging root: {path}")
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+
+
+def _invoke_fault(config, stage):
+    fault = config.get("_fault_injector")
+    if callable(fault):
+        fault(stage)
+
+
 from core.localizations import generate_species_localizations
 from core.ppuipkg import (
     normalise_mod_asset_package, read_package, write_package,
@@ -1017,20 +1106,8 @@ def write_scaffold(out_dir, mod_name, plans, config, report):
 
     # Manifest
     with open(os.path.join(out_dir, "Manifest.xml"), "w") as f:
-        f.write(MANIFEST_XML.format(name=mod_name, uuid=uuid_mod.uuid4()))
+        f.write(MANIFEST_XML.format(name=mod_name, uuid=config["uuid"]))
     written.append("Manifest.xml")
-
-    # Clean up stale species/cosmetic .lua files in Main
-    valid_lua_names = {f"{p.lower()}.lua" for p in all_prefab_names}
-    if os.path.isdir(main_dir):
-        for fname in os.listdir(main_dir):
-            if fname.endswith(".lua"):
-                if not (fname.startswith("database.") or fname.startswith("managers.") or fname.startswith("techtrees.")):
-                    if fname.lower() not in valid_lua_names:
-                        try:
-                            os.remove(os.path.join(main_dir, fname))
-                        except Exception:
-                            pass
 
     # Optional per-species scaling
     scaling = config.get("scaling")
@@ -1051,25 +1128,30 @@ def write_scaffold(out_dir, mod_name, plans, config, report):
         if r.lower() in {p.lower() for p in all_prefab_names}
         or r.lower().startswith(mod_name.lower())}
 
-    # Clean up stale .assetpkg files in Init
-    valid_ap_names = {f"{p.lower()}.assetpkg" for p in mod_owned}
-    if os.path.isdir(init_dir):
-        for fname in os.listdir(init_dir):
-            if fname.endswith(".assetpkg"):
-                if fname.lower() not in valid_ap_names:
-                    try:
-                        os.remove(os.path.join(init_dir, fname))
-                    except Exception:
-                        pass
-
-
     root_ap = config.get("asset_packages") or {}
+    if not isinstance(root_ap, dict):
+        raise ValueError("asset_packages must be an object mapping package names to paths")
     category = config.get("asset_category") or "Land"
 
-    for pkg in sorted(mod_owned):
-        pkg_file = os.path.join(init_dir, f"{pkg.lower()}.assetpkg")
+    # Every row in the Asset Packages editor is an output instruction. Its key
+    # is the exact .assetpkg basename and its value is the exact OVL asset path.
+    # Configured casing wins over an inferred prefab package with the same name.
+    package_names = {str(pkg).lower(): str(pkg) for pkg in mod_owned}
+    for configured_name, configured_path in root_ap.items():
+        if not isinstance(configured_name, str) or not configured_name:
+            raise ValueError("Asset-package names must be non-empty strings")
+        if not isinstance(configured_path, str) or not configured_path.strip():
+            raise ValueError(f"Asset package {configured_name!r} must have a non-empty path")
+        package_names[configured_name.lower()] = configured_name
+
+    for pkg in sorted(package_names.values(), key=str.lower):
+        validate_output_identifier(pkg, "Generated asset-package name")
+        pkg_file = _exact_case_output_path(init_dir, f"{pkg}.assetpkg")
 
         raw_path = root_ap.get(pkg)
+        if not raw_path:
+            raw_path = next((value for key, value in root_ap.items()
+                             if str(key).lower() == pkg.lower()), None)
         if not raw_path:
             base_sp_name = None
             for p in plans:
@@ -1088,6 +1170,9 @@ def write_scaffold(out_dir, mod_name, plans, config, report):
         if not asset_path_str.lower().startswith("ovldata\\"):
             clean_path = asset_path_str.lstrip("\\/")
             asset_path_str = f"ovldata\\{mod_name}\\{clean_path}"
+        path_parts = [part for part in asset_path_str.split("\\") if part]
+        if any(part in (".", "..") for part in path_parts):
+            raise ValueError(f"Asset package {pkg!r} contains path traversal: {asset_path_str!r}")
 
 
         xml_content = (
@@ -1103,14 +1188,11 @@ def write_scaffold(out_dir, mod_name, plans, config, report):
         ovl_prefix = f"ovldata\\{mod_name}\\".lower()
         if rel_folder.lower().startswith(ovl_prefix):
             rel_folder = rel_folder[len(ovl_prefix):]
-        elif rel_folder.lower().startswith("ovldata\\"):
-            parts = rel_folder.split("\\", 2)
-            rel_folder = parts[2] if len(parts) > 2 else rel_folder
-
-        pkg_dir = os.path.normpath(os.path.join(out_dir, rel_folder))
-        os.makedirs(pkg_dir, exist_ok=True)
-        rel_posix = rel_folder.replace("\\", "/")
-        written.append(rel_posix)
+            pkg_dir = os.path.normpath(os.path.join(out_dir, rel_folder))
+            if os.path.commonpath([os.path.realpath(out_dir), os.path.realpath(pkg_dir)]) != os.path.realpath(out_dir):
+                raise ValueError(f"Asset package {pkg!r} escapes the generated mod directory")
+            os.makedirs(pkg_dir, exist_ok=True)
+            written.append(rel_folder.replace("\\", "/"))
 
 
 
@@ -1120,9 +1202,157 @@ def write_scaffold(out_dir, mod_name, plans, config, report):
 
 
 
-def generate_species(mod_name, plans, report, config):
-    """Orchestrate FDB database cloning and scaffolding file generation."""
-    out_dir = os.path.join(BASE_DIR, "Generated", mod_name)
+def _load_ownership(out_dir):
+    path = os.path.join(out_dir, OWNERSHIP_FILE)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+        return data.get("files", {}) if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _normalise_written_paths(out_dir, written):
+    owned = set()
+    for item in written:
+        rel = str(item).replace("\\", "/")
+        direct = os.path.join(out_dir, *rel.split("/"))
+        main = os.path.join(out_dir, "Main", *rel.split("/"))
+        path = direct if os.path.isfile(direct) else main
+        if os.path.isfile(path):
+            owned.add(os.path.relpath(path, out_dir).replace("\\", "/"))
+    return owned
+
+
+def _snapshot_modified_owned(out_dir, ownership):
+    saved = {}
+    for rel, expected in ownership.items():
+        path = os.path.join(out_dir, *rel.split("/"))
+        if os.path.isfile(path) and _sha256(path) != expected:
+            with open(path, "rb") as stream:
+                saved[rel] = stream.read()
+    return saved
+
+
+def _reconcile_owned_files(out_dir, old_ownership, current_owned,
+                           modified_snapshots, report):
+    conflicts = []
+    current_by_case = {rel.casefold(): rel for rel in current_owned}
+    modified_by_case = {rel.casefold(): (rel, content)
+                        for rel, content in modified_snapshots.items()}
+    for rel, old_hash in old_ownership.items():
+        current_rel = current_by_case.get(rel.casefold())
+        modified_entry = modified_by_case.get(rel.casefold())
+        effective_rel = current_rel or rel
+        path = os.path.join(out_dir, *effective_rel.split("/"))
+        if modified_entry is not None:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as stream:
+                stream.write(modified_entry[1])
+            conflicts.append(effective_rel)
+            if current_rel:
+                current_owned.discard(current_rel)
+        elif current_rel is None and os.path.isfile(path):
+            if _sha256(path) == old_hash:
+                os.remove(path)
+            else:
+                conflicts.append(rel)
+
+    if conflicts:
+        report.setdefault("warnings", []).append(
+            "Preserved hand-edited generator files and stopped tracking them: "
+            + ", ".join(sorted(conflicts)))
+        report["preserved_generated_file_conflicts"] = sorted(conflicts)
+
+    files = {}
+    for rel in sorted(current_owned):
+        path = os.path.join(out_dir, *rel.split("/"))
+        if os.path.isfile(path):
+            files[rel] = _sha256(path)
+    with open(os.path.join(out_dir, OWNERSHIP_FILE), "w", encoding="utf-8") as stream:
+        json.dump({"version": 1, "files": files}, stream, indent=2, sort_keys=True)
+
+
+def _resolve_project_uuid(config, existing_out):
+    candidate = None
+    manifest = os.path.join(existing_out, "Manifest.xml")
+    if os.path.isfile(manifest):
+        try:
+            with open(manifest, "r", encoding="utf-8") as stream:
+                match = re.search(r"<ID>\s*([^<]+)\s*</ID>", stream.read())
+            candidate = match.group(1).strip() if match else None
+        except OSError:
+            candidate = None
+    if not candidate:
+        project_path = os.path.join(existing_out, "mod_project.json")
+        if os.path.isfile(project_path):
+            try:
+                with open(project_path, "r", encoding="utf-8") as stream:
+                    candidate = json.load(stream).get("uuid")
+            except (OSError, ValueError, AttributeError):
+                candidate = None
+    if not candidate:
+        candidate = config.get("uuid")
+    if candidate:
+        try:
+            return str(uuid_mod.UUID(str(candidate)))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError(f"Project UUID is malformed: {candidate!r}") from exc
+    return str(uuid_mod.uuid4())
+
+
+def _validate_staging(out_dir, plans, dino_fdb, exp_fdb):
+    for path in (dino_fdb, exp_fdb):
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            result = con.execute("PRAGMA integrity_check").fetchone()
+            if result != ("ok",):
+                raise RuntimeError(f"SQLite integrity check failed for {path}: {result}")
+        finally:
+            con.close()
+
+    con = sqlite3.connect(f"file:{dino_fdb}?mode=ro", uri=True)
+    try:
+        expected = []
+        for plan in plans:
+            expected.extend((m["target_sid"], m["target_name"], m["target_prefab"])
+                            for m in plan.get("_resolved_members") or [])
+        for sid, name, prefab in expected:
+            row = con.execute(
+                "SELECT Name, Prefab FROM Species WHERE SpeciesID=?", (sid,)).fetchone()
+            if row != (name, prefab):
+                raise RuntimeError(
+                    f"Staging identity validation failed for SpeciesID {sid}: "
+                    f"expected {(name, prefab)!r}, found {row!r}")
+        prefab_refs = {r[0] for r in con.execute(
+            "SELECT Prefab FROM Species WHERE Prefab IS NOT NULL UNION "
+            "SELECT Prefab FROM SpeciesCosmeticSets WHERE Prefab IS NOT NULL")}
+    finally:
+        con.close()
+    main_dir = os.path.join(out_dir, "Main")
+    generated_names = {
+        os.path.splitext(name)[0].lower() for name in os.listdir(main_dir)
+        if name.lower().endswith(".lua") and not name.lower().startswith(
+            ("database.", "managers.", "techtrees."))}
+    missing = sorted(p for p in prefab_refs if p.lower() not in generated_names)
+    if missing:
+        raise RuntimeError(f"Generated prefab references have no matching Main Lua: {missing}")
+
+    audit_report = {"warnings": []}
+    referenced, existing = audit_asset_packages(
+        main_dir, os.path.join(out_dir, "Init"), audit_report)
+    expected_owned = {r for r in referenced if any(
+        r.lower().startswith(plan["config"]["name"].lower()) for plan in plans)}
+    existing_lower = {e.lower() for e in existing}
+    missing_owned = sorted(r for r in expected_owned if r.lower() not in existing_lower)
+    if missing_owned:
+        raise RuntimeError(f"Generated asset packages are missing: {missing_owned}")
+
+
+def _build_species(out_dir, mod_name, plans, report, config):
+    """Build a complete project into an already-created staging directory."""
     main_dir = os.path.join(out_dir, "Main")
     os.makedirs(main_dir, exist_ok=True)
 
@@ -1132,24 +1362,9 @@ def generate_species(mod_name, plans, report, config):
     dst_dino_fdb = os.path.join(main_dir, f"{mod_name.lower()}dinosaurs.fdb")
     dst_exp_fdb = os.path.join(main_dir, f"{mod_name.lower()}expeditions.fdb")
 
-    # The FDBs are rebuilt from scratch, so any stale copy is removed first.
-    # On Windows this fails with PermissionError if ANYTHING still holds the
-    # file open - most often this app's own editor pages, or the .fdb opened in
-    # a SQLite browser. The raw WinError 32 is unhelpful, so translate it into
-    # something actionable rather than letting it surface as a stack trace.
     for _fdb in (dst_dino_fdb, dst_exp_fdb):
-        if not os.path.isfile(_fdb):
-            continue
-        try:
+        if os.path.isfile(_fdb):
             os.remove(_fdb)
-        except PermissionError:
-            raise RuntimeError(
-                f"Cannot rebuild '{os.path.basename(_fdb)}' because the file is "
-                f"open in another program.\n\n"
-                f"Close anything using it - the Edit Built Mod / Expeditions "
-                f"pages in this app, or an external SQLite viewer - then "
-                f"generate again.\n\nPath: {_fdb}"
-            )
 
     # Clone dinosaurs.fdb & expeditions.fdb
     for plan in plans:
@@ -1176,6 +1391,7 @@ def generate_species(mod_name, plans, report, config):
 
         resolved_members = dino_res.get("_resolved_members") if isinstance(dino_res, dict) else None
         plan["_resolved_members"] = resolved_members
+        _invoke_fault(config, "dinosaur_clone")
 
 
         clone_expeditions_fdb(
@@ -1190,6 +1406,7 @@ def generate_species(mod_name, plans, report, config):
             report=report,
             resolved_members=resolved_members
         )
+        _invoke_fault(config, "expedition_clone")
 
 
 
@@ -1213,10 +1430,126 @@ def generate_species(mod_name, plans, report, config):
             # be written for a set that was never cloned.
             plan["cosmetic_plan"] = []
 
-    write_scaffold(out_dir, mod_name, plans, config, report)
+    written = write_scaffold(out_dir, mod_name, plans, config, report)
+    _invoke_fault(config, "scaffolding")
+    project_path = os.path.join(out_dir, "mod_project.json")
+    persisted_config = {k: v for k, v in config.items() if not k.startswith("_")}
+    with open(project_path, "w", encoding="utf-8") as stream:
+        json.dump(persisted_config, stream, indent=2)
+    _validate_staging(out_dir, plans, dst_dino_fdb, dst_exp_fdb)
+    _invoke_fault(config, "validation")
 
     return {
         "dinosaurs_fdb": dst_dino_fdb,
         "expeditions_fdb": dst_exp_fdb,
-        "output_dir": out_dir
+        "output_dir": out_dir,
+        "project_file": project_path,
+        "_written": written,
     }
+
+
+def generate_species(mod_name, plans, report, config):
+    """Preflight, stage, validate, and recoverably publish a generated mod."""
+    validate_output_identifier(mod_name, "Mod project name")
+    species_configs = config.get("species") or [p["config"] for p in plans]
+    if not species_configs:
+        raise ValueError("At least one species is required")
+    seen_names = set()
+    for index, sp_conf in enumerate(species_configs):
+        name = validate_output_identifier(
+            sp_conf.get("name"), f"Species #{index + 1} name")
+        key = name.casefold()
+        if key in seen_names:
+            raise ValueError(f"Duplicate generated species name: {name!r}")
+        seen_names.add(key)
+
+    source_dino = config.get("source_dinosaurs_fdb") or os.path.join(
+        BASE_DIR, "extracted_fdbs", "c0dinosaurs.fdb")
+    source_exp = config.get("source_expeditions_fdb") or os.path.join(
+        BASE_DIR, "extracted_fdbs", "c0expeditions.fdb")
+    if not os.path.isfile(source_dino):
+        raise FileNotFoundError(f"Source dinosaur FDB not found: {source_dino}")
+    if not os.path.isfile(source_exp):
+        raise FileNotFoundError(f"Source expeditions FDB not found: {source_exp}")
+    allocate_species_ids(species_configs, source_dino)
+    con = sqlite3.connect(f"file:{source_dino}?mode=ro", uri=True)
+    try:
+        for sp_conf in species_configs:
+            members = resolve_family_members(
+                con, sp_conf["source"], sp_conf["name"], sp_conf["species_id"],
+                donor_prefabs=sp_conf.get("donor_prefabs"),
+                family_members=sp_conf.get("family_members"))
+            for member in members:
+                validate_output_identifier(
+                    member["target_name"], "Generated family member name")
+                validate_output_identifier(
+                    member["target_prefab"], "Generated prefab name")
+    finally:
+        con.close()
+
+    output_root = config.get("_output_root") or os.path.join(BASE_DIR, "Generated")
+    os.makedirs(output_root, exist_ok=True)
+    final_out = os.path.join(output_root, mod_name)
+    _assert_tree_safe(final_out)
+    config["uuid"] = _resolve_project_uuid(config, final_out)
+
+    staging = tempfile.mkdtemp(prefix=f".{mod_name}.staging-", dir=output_root)
+    backup = os.path.join(output_root, f".{mod_name}.backup-{uuid_mod.uuid4().hex}")
+    old_moved = False
+    had_original = os.path.isdir(final_out)
+    published = False
+    keep_staging = False
+    try:
+        if os.path.isdir(final_out):
+            shutil.copytree(final_out, staging, dirs_exist_ok=True, copy_function=shutil.copy2)
+        old_ownership = _load_ownership(staging)
+        modified = _snapshot_modified_owned(staging, old_ownership)
+        paths = _build_species(staging, mod_name, plans, report, config)
+        current_owned = _normalise_written_paths(staging, paths.pop("_written"))
+        _reconcile_owned_files(staging, old_ownership, current_owned, modified, report)
+
+        _invoke_fault(config, "before_publish")
+        if os.path.isdir(final_out):
+            try:
+                os.replace(final_out, backup)
+            except OSError as move_exc:
+                raise RuntimeError(
+                    f"Cannot publish because the existing generated mod is locked or "
+                    f"cannot be renamed. Close SQLite viewers and editor handles, then "
+                    f"retry. The original is untouched at {final_out!r}: {move_exc}") from move_exc
+            old_moved = True
+        try:
+            os.replace(staging, final_out)
+            published = True
+        except Exception as publish_exc:
+            if old_moved:
+                try:
+                    os.replace(backup, final_out)
+                    old_moved = False
+                except Exception as rollback_exc:
+                    keep_staging = True
+                    raise RuntimeError(
+                        f"Publishing failed and rollback also failed. Recovery copy remains at "
+                        f"{backup!r}; staging remains at {staging!r}. Publish error: "
+                        f"{publish_exc}; rollback error: {rollback_exc}") from publish_exc
+            if had_original:
+                message = "Publishing staged project failed; original was restored"
+            else:
+                message = "Publishing staged project failed before any existing project was moved"
+            raise RuntimeError(f"{message}: {publish_exc}") from publish_exc
+
+        if old_moved and os.path.isdir(backup):
+            try:
+                _safe_rmtree(backup, output_root)
+            except Exception as cleanup_exc:
+                report.setdefault("warnings", []).append(
+                    f"Published successfully; old backup retained at {backup}: {cleanup_exc}")
+        return {
+            "dinosaurs_fdb": os.path.join(final_out, "Main", f"{mod_name.lower()}dinosaurs.fdb"),
+            "expeditions_fdb": os.path.join(final_out, "Main", f"{mod_name.lower()}expeditions.fdb"),
+            "output_dir": final_out,
+            "project_file": os.path.join(final_out, "mod_project.json"),
+        }
+    finally:
+        if not published and not keep_staging and os.path.isdir(staging):
+            _safe_rmtree(staging, output_root)

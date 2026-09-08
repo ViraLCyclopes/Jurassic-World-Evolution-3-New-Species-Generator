@@ -12,6 +12,97 @@ from core.templates import (
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IDENT_RE = re.compile(r"SpeciesID", re.IGNORECASE)
+MAX_GENERATED_ID = 99999999
+
+
+def _schema_signature(con, table):
+    """Return the parts of a table schema that affect safe row cloning."""
+    info = [tuple(r[1:6]) for r in con.execute(f'PRAGMA table_info("{table}")')]
+    foreign_keys = [tuple(r[2:8]) for r in con.execute(
+        f'PRAGMA foreign_key_list("{table}")')]
+    unique = []
+    for idx in con.execute(f'PRAGMA index_list("{table}")'):
+        if not idx[2]:
+            continue
+        unique.append(tuple(r[2] for r in con.execute(
+            f'PRAGMA index_info("{idx[1]}")')))
+    return info, sorted(foreign_keys), sorted(unique)
+
+
+def ensure_destination_schema(con_src, con_dst, tables=None):
+    """Create absent source tables and reject incompatible existing tables."""
+    wanted = set(tables) if tables is not None else None
+    source_tables = con_src.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name"
+    ).fetchall()
+    for table, create_sql in source_tables:
+        if table.startswith("sqlite_") or (wanted is not None and table not in wanted):
+            continue
+        existing = con_dst.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if not existing:
+            if not create_sql:
+                raise RuntimeError(f"Source table {table!r} has no CREATE SQL")
+            con_dst.execute(create_sql)
+            continue
+        if _schema_signature(con_src, table) != _schema_signature(con_dst, table):
+            raise RuntimeError(
+                f"Destination schema conflict for table {table!r}; its columns, "
+                "constraints, or unique keys differ from the configured source FDB")
+
+
+def _unique_keys(con, table):
+    pk = [r[1] for r in sorted(
+        con.execute(f'PRAGMA table_info("{table}")').fetchall(),
+        key=lambda r: r[5]) if r[5]]
+    keys = [tuple(pk)] if pk else []
+    for idx in con.execute(f'PRAGMA index_list("{table}")'):
+        if idx[2]:
+            cols = tuple(r[2] for r in con.execute(
+                f'PRAGMA index_info("{idx[1]}")'))
+            if cols and cols not in keys:
+                keys.append(cols)
+    return keys
+
+
+def insert_rows_strict(con, table, cols, rows, species):
+    """Insert rows, deduplicating only byte-for-byte identical key conflicts."""
+    if not rows:
+        return 0
+    placeholders = ", ".join(["?"] * len(cols))
+    col_list = ", ".join(f'"{c}"' for c in cols)
+    sql = f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders})'
+    unique_keys = _unique_keys(con, table)
+    inserted = 0
+    for row in rows:
+        try:
+            con.execute(sql, row)
+            inserted += 1
+            continue
+        except sqlite3.IntegrityError as exc:
+            row_map = dict(zip(cols, row))
+            match = None
+            match_key = None
+            for key_cols in unique_keys:
+                if any(row_map.get(c) is None for c in key_cols):
+                    continue
+                where = " AND ".join(f'"{c}" = ?' for c in key_cols)
+                candidate = con.execute(
+                    f'SELECT * FROM "{table}" WHERE {where}',
+                    [row_map[c] for c in key_cols]).fetchone()
+                if candidate is not None:
+                    match = tuple(candidate)
+                    match_key = {c: row_map[c] for c in key_cols}
+                    break
+            if match is not None and match == tuple(row):
+                continue
+            key_text = match_key if match_key is not None else "unknown unique key"
+            raise RuntimeError(
+                f"Row conflict while cloning species {species!r}: table "
+                f"{table!r}, key {key_text}. Existing and generated contents differ. "
+                f"SQLite reported: {exc}") from exc
+    return inserted
 
 
 def table_names(con):
@@ -141,6 +232,76 @@ def resolve_member_donor(con_src, search_term, default_name):
     return None
 
 
+def resolve_family_members(con_src, donor_species, new_species, new_species_id,
+                           donor_prefabs=None, family_members=None):
+    """Resolve the exact enabled family and offsets used by cloning."""
+    donor_prefabs = donor_prefabs or {}
+    src_info = lookup_species(con_src, donor_species)
+    if not src_info:
+        raise ValueError(f"Donor species {donor_species!r} not found in configured source FDB")
+    src_species_id, _src_genetic_id, src_name_actual = src_info
+    base_prefix = src_name_actual[:-7] if src_name_actual.endswith("_Female") else src_name_actual
+
+    member_specs = []
+    if isinstance(family_members, list) and family_members:
+        for m in family_members:
+            if isinstance(m, dict):
+                if m.get("enabled") is False or m.get("checked") is False:
+                    continue
+                m_name = m.get("Name") or m.get("name") or src_name_actual
+                m_pref = m.get("Prefab") or m.get("prefab") or m_name
+            else:
+                m_name = m_pref = str(m)
+            donor_fem_pref = donor_prefabs.get("Female") or src_name_actual
+            has_fem_suffix = donor_fem_pref.lower().endswith("_female")
+            if m_name in (src_name_actual, base_prefix, f"{base_prefix}_Female"):
+                tgt_name = new_species
+                tgt_prefab = f"{new_species}_Female" if has_fem_suffix else new_species
+                key = "Female"
+            elif m_name.startswith(base_prefix):
+                suffix = m_name[len(base_prefix):]
+                tgt_name = new_species + suffix
+                tgt_prefab = tgt_name
+                key = suffix.lstrip("_")
+            else:
+                tgt_name = f"{new_species}_{m_name}"
+                tgt_prefab = tgt_name
+                key = m_name
+            member_specs.append((key, len(member_specs), tgt_name, tgt_prefab,
+                                 m_pref, m_name))
+
+    if not member_specs:
+        donor_fem_pref = donor_prefabs.get("Female") or src_name_actual
+        has_fem_suffix = donor_fem_pref.lower().endswith("_female")
+        fem_pref = f"{new_species}_Female" if has_fem_suffix else new_species
+        member_specs = [
+            ("Female", 0, new_species, fem_pref, donor_prefabs.get("Female"), src_name_actual),
+            ("Male", 1, f"{new_species}_Male", f"{new_species}_Male",
+             donor_prefabs.get("Male"), f"{base_prefix}_Male"),
+            ("Juvenile", 2, f"{new_species}_Juvenile", f"{new_species}_Juvenile",
+             donor_prefabs.get("Juvenile"), f"{base_prefix}_Juvenile"),
+        ]
+
+    resolved = []
+    for key, offset, tgt_name, tgt_prefab, pref_term, default_name in member_specs:
+        row = resolve_member_donor(con_src, pref_term, default_name)
+        if not row and key == "Female":
+            row = (src_species_id, src_name_actual,
+                   donor_prefabs.get("Female") or src_name_actual)
+        if row:
+            sid, source_name, source_prefab = row
+            resolved.append({
+                "key": key, "offset": offset,
+                "target_sid": new_species_id + offset,
+                "target_name": tgt_name, "target_prefab": tgt_prefab,
+                "src_sid": sid, "src_name": source_name,
+                "src_prefab": source_prefab,
+            })
+    if not resolved:
+        raise ValueError(f"Donor {donor_species!r} has no enabled resolvable family members")
+    return resolved
+
+
 def clone_fdb(source_fdb, target_fdb, donor_species, new_species,
               new_species_id, new_genetic_id, donor_prefabs=None, fdb_overrides=None, report=None):
     """Clone rows for `donor_species` in `source_fdb` to `target_fdb` under `new_species`.
@@ -169,8 +330,7 @@ def clone_fdb(source_fdb, target_fdb, donor_species, new_species,
         )
 
     if not os.path.isfile(source_fdb):
-        report.setdefault("warnings", []).append(f"Source FDB not found: {source_fdb}")
-        return {}
+        raise FileNotFoundError(f"Source FDB not found: {source_fdb}")
 
     con_src = sqlite3.connect(f"file:{source_fdb}?mode=ro", uri=True)
     con_dst = sqlite3.connect(target_fdb)
@@ -181,98 +341,31 @@ def clone_fdb(source_fdb, target_fdb, donor_species, new_species,
 
         src_info = lookup_species(con_src, donor_species)
         if not src_info:
-            report.setdefault("warnings", []).append(f"Donor species {donor_species!r} not found in {source_fdb}")
-            return {}
+            raise ValueError(f"Donor species {donor_species!r} not found in {source_fdb}")
 
         src_species_id, src_genetic_id, src_name_actual = src_info
-        base_prefix = src_name_actual[:-7] if src_name_actual.endswith("_Female") else src_name_actual
-
-        family_members = fdb_overrides.get("family_members") if isinstance(fdb_overrides, dict) else None
-        if family_members and isinstance(family_members, list) and len(family_members) > 0:
-            member_specs = []
-            idx = 0
-            for m in family_members:
-                if isinstance(m, dict):
-                    if m.get("enabled") is False or m.get("checked") is False:
-                        continue
-                    m_name = m.get("Name") or m.get("name") or src_name_actual
-                    m_pref = m.get("Prefab") or m.get("prefab") or m_name
-                else:
-                    m_name, m_pref = str(m), str(m)
-
-                donor_fem_pref = donor_prefabs.get("Female") or src_name_actual
-                has_fem_suffix = donor_fem_pref.lower().endswith("_female")
-
-                if m_name == src_name_actual or m_name == base_prefix or m_name == f"{base_prefix}_Female":
-                    tgt_name = new_species
-                    tgt_prefab = f"{new_species}_Female" if has_fem_suffix else new_species
-                    gender_key = "Female"
-                elif m_name.startswith(base_prefix):
-                    suffix = m_name[len(base_prefix):]
-                    tgt_name = new_species + suffix
-                    tgt_prefab = tgt_name
-                    gender_key = suffix.lstrip('_')
-                else:
-                    tgt_name = f"{new_species}_{m_name}"
-                    tgt_prefab = tgt_name
-                    gender_key = m_name
-
-                member_specs.append((gender_key, idx, tgt_name, tgt_prefab, m_pref, m_name))
-                idx += 1
-            if not member_specs:
-                donor_fem_pref = donor_prefabs.get("Female") or src_name_actual
-                has_fem_suffix = donor_fem_pref.lower().endswith("_female")
-                fem_pref = f"{new_species}_Female" if has_fem_suffix else new_species
-                member_specs = [
-                    ("Female", 0, new_species, fem_pref, donor_prefabs.get("Female"), src_name_actual),
-                    ("Male", 1, f"{new_species}_Male", f"{new_species}_Male", donor_prefabs.get("Male"), f"{base_prefix}_Male"),
-                    ("Juvenile", 2, f"{new_species}_Juvenile", f"{new_species}_Juvenile", donor_prefabs.get("Juvenile"), f"{base_prefix}_Juvenile")
-                ]
-        else:
-            donor_fem_pref = donor_prefabs.get("Female") or src_name_actual
-            has_fem_suffix = donor_fem_pref.lower().endswith("_female")
-            fem_pref = f"{new_species}_Female" if has_fem_suffix else new_species
-            member_specs = [
-                ("Female", 0, new_species, fem_pref, donor_prefabs.get("Female"), src_name_actual),
-                ("Male", 1, f"{new_species}_Male", f"{new_species}_Male", donor_prefabs.get("Male"), f"{base_prefix}_Male"),
-                ("Juvenile", 2, f"{new_species}_Juvenile", f"{new_species}_Juvenile", donor_prefabs.get("Juvenile"), f"{base_prefix}_Juvenile")
-            ]
-
-
-
-        resolved_members = []
+        resolved_members = resolve_family_members(
+            con_src, donor_species, new_species, new_species_id,
+            donor_prefabs=donor_prefabs,
+            family_members=fdb_overrides.get("family_members"))
         member_id_map = {}
         member_name_map = {}
         src_sids = []
         src_names = set()
 
-        for key, idx, tgt_name, tgt_prefab, pref_term, def_name in member_specs:
-            row = resolve_member_donor(con_src, pref_term, def_name)
-            if not row and key == "Female":
-                row = (src_species_id, src_name_actual, donor_prefabs.get("Female") or src_name_actual)
-
-            if row:
-                s_id, s_name, s_pref = row
-                tgt_sid = new_species_id + idx
-                resolved_members.append({
-                    "key": key,
-                    "target_sid": tgt_sid,
-                    "target_name": tgt_name,
-                    "target_prefab": tgt_prefab,
-                    "src_sid": s_id,
-                    "src_name": s_name,
-                    "src_prefab": s_pref
-                })
-
-                if s_id not in member_id_map:
-                    member_id_map[s_id] = tgt_sid
-                if s_name not in member_name_map:
-                    member_name_map[s_name] = tgt_name
-                src_sids.append(s_id)
-                src_names.add(s_name)
+        for member in resolved_members:
+            s_id = member["src_sid"]
+            s_name = member["src_name"]
+            if s_id not in member_id_map:
+                member_id_map[s_id] = member["target_sid"]
+            if s_name not in member_name_map:
+                member_name_map[s_name] = member["target_name"]
+            src_sids.append(s_id)
+            src_names.add(s_name)
 
         cur_src.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
         tables = cur_src.fetchall()
+        ensure_destination_schema(con_src, con_dst)
         written_summary = {}
 
         # --- Donor asset packages, per family member ---
@@ -471,7 +564,6 @@ def clone_fdb(source_fdb, target_fdb, donor_species, new_species,
             if tbl_name.startswith("sqlite_"):
                 continue
 
-            cur_dst.execute(create_sql)
             cur_src.execute(f'PRAGMA table_info("{tbl_name}")')
             cols = [info[1] for info in cur_src.fetchall()]
 
@@ -739,15 +831,19 @@ def clone_fdb(source_fdb, target_fdb, donor_species, new_species,
                             new_rows.append([row_dict[c] for c in cols])
 
             if new_rows:
-                placeholders = ", ".join(["?"] * len(cols))
-                col_list = ", ".join([f'"{c}"' for c in cols])
-                insert_sql = f'INSERT INTO "{tbl_name}" ({col_list}) VALUES ({placeholders})'
-                cur_dst.executemany(insert_sql, new_rows)
-                written_summary[tbl_name] = len(new_rows)
+                inserted = insert_rows_strict(
+                    con_dst, tbl_name, cols, new_rows, new_species)
+                if inserted:
+                    written_summary[tbl_name] = inserted
 
         con_dst.commit()
         written_summary["_resolved_members"] = resolved_members
-        report.setdefault("tables", {}).update(written_summary)
+        totals = report.setdefault("tables", {})
+        for table, count in written_summary.items():
+            if not table.startswith("_"):
+                totals[table] = totals.get(table, 0) + count
+        report.setdefault("species_results", {})[new_species] = {
+            k: v for k, v in written_summary.items() if not k.startswith("_")}
         return written_summary
 
     finally:
@@ -773,8 +869,7 @@ def clone_expeditions_fdb(source_exp_fdb, target_exp_fdb, donor_species, new_spe
     fdb_overrides = fdb_overrides or {}
 
     if not os.path.isfile(source_exp_fdb):
-        report.setdefault("warnings", []).append(f"Expeditions source FDB not found: {source_exp_fdb}")
-        return {}
+        raise FileNotFoundError(f"Expeditions source FDB not found: {source_exp_fdb}")
 
     con_src = sqlite3.connect(f"file:{source_exp_fdb}?mode=ro", uri=True)
     con_dst = sqlite3.connect(target_exp_fdb)
@@ -785,8 +880,7 @@ def clone_expeditions_fdb(source_exp_fdb, target_exp_fdb, donor_species, new_spe
 
         cur_src.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
         tables = [r for r in cur_src.fetchall() if not r[0].startswith("sqlite_")]
-        for tbl_name, create_sql in tables:
-            cur_dst.execute(create_sql)
+        ensure_destination_schema(con_src, con_dst)
 
         written_summary = {}
 
@@ -833,11 +927,13 @@ def clone_expeditions_fdb(source_exp_fdb, target_exp_fdb, donor_species, new_spe
                 new_grows.append([gdict[c] for c in gcols])
 
 
-        if new_grows:
-            placeholders = ", ".join(["?"] * len(gcols))
-            col_list = ", ".join([f'"{c}"' for c in gcols])
-            cur_dst.executemany(f'INSERT INTO "Genomes" ({col_list}) VALUES ({placeholders})', new_grows)
-            written_summary["Genomes"] = len(new_grows)
+        if not new_grows:
+            raise ValueError(
+                f"Donor species {donor_species!r} has no matching Genomes rows "
+                f"in configured expeditions FDB {source_exp_fdb!r}")
+        count = insert_rows_strict(con_dst, "Genomes", gcols, new_grows, new_species)
+        if count:
+            written_summary["Genomes"] = count
 
 
         # 2. Fossils & FossilsRebirth
@@ -865,10 +961,9 @@ def clone_expeditions_fdb(source_exp_fdb, target_exp_fdb, donor_species, new_spe
                 new_frows.append([fdict[c] for c in fcols])
 
             if new_frows:
-                placeholders = ", ".join(["?"] * len(fcols))
-                col_list = ", ".join([f'"{c}"' for c in fcols])
-                cur_dst.executemany(f'INSERT INTO "{ftable}" ({col_list}) VALUES ({placeholders})', new_frows)
-                written_summary[ftable] = len(new_frows)
+                count = insert_rows_strict(con_dst, ftable, fcols, new_frows, new_species)
+                if count:
+                    written_summary[ftable] = count
 
         # 3. DigSiteFossils, DigSiteFossilsRebirth, DigSiteFossilsChallenge
         donor_sites = set()
@@ -893,10 +988,9 @@ def clone_expeditions_fdb(source_exp_fdb, target_exp_fdb, donor_species, new_spe
                 new_dsrows.append([dsdict[c] for c in dscols])
 
             if new_dsrows:
-                placeholders = ", ".join(["?"] * len(dscols))
-                col_list = ", ".join([f'"{c}"' for c in dscols])
-                cur_dst.executemany(f'INSERT INTO "{dstable}" ({col_list}) VALUES ({placeholders})', new_dsrows)
-                written_summary[dstable] = len(new_dsrows)
+                count = insert_rows_strict(con_dst, dstable, dscols, new_dsrows, new_species)
+                if count:
+                    written_summary[dstable] = count
 
         # 4. If custom_digsite is True, clone DigSites & Tasks for custom location
         if custom_digsite and donor_sites:
@@ -928,18 +1022,23 @@ def clone_expeditions_fdb(source_exp_fdb, target_exp_fdb, donor_species, new_spe
                         if trow:
                             tdict = dict(zip(tcols, trow))
                             tdict["ID"] = new_task_id
-                            placeholders = ", ".join(["?"] * len(tcols))
-                            col_list = ", ".join([f'"{c}"' for c in tcols])
-                            cur_dst.execute(f'INSERT INTO "Tasks" ({col_list}) VALUES ({placeholders})', [tdict[c] for c in tcols])
-                            written_summary["Tasks"] = 1
+                            count = insert_rows_strict(
+                                con_dst, "Tasks", tcols,
+                                [[tdict[c] for c in tcols]], new_species)
+                            if count:
+                                written_summary["Tasks"] = written_summary.get("Tasks", 0) + count
 
-                    placeholders = ", ".join(["?"] * len(scols))
-                    col_list = ", ".join([f'"{c}"' for c in scols])
-                    cur_dst.execute(f'INSERT INTO "{s_tbl}" ({col_list}) VALUES ({placeholders})', [sdict[c] for c in scols])
-                    written_summary[s_tbl] = 1
+                    count = insert_rows_strict(
+                        con_dst, s_tbl, scols,
+                        [[sdict[c] for c in scols]], new_species)
+                    if count:
+                        written_summary[s_tbl] = written_summary.get(s_tbl, 0) + count
 
         con_dst.commit()
-        report.setdefault("exp_tables", {}).update(written_summary)
+        totals = report.setdefault("exp_tables", {})
+        for table, count in written_summary.items():
+            totals[table] = totals.get(table, 0) + count
+        report.setdefault("exp_species_results", {})[new_species] = dict(written_summary)
         return written_summary
     finally:
         con_src.close()
@@ -1161,62 +1260,92 @@ def list_generated_mods():
 
 
 def allocate_species_ids(species_configs, fdb_path=None, floor=DEFAULT_ID_FLOOR):
-    """Ensure every species in species_configs has a valid species_id and genetic_id.
-    Auto-assigns unique random IDs (3000 to 999999) if missing.
-    """
-    import random
-
+    """Validate and allocate complete, non-overlapping generated families."""
     c0_path = os.path.join(BASE_DIR, "extracted_fdbs", "c0dinosaurs.fdb")
     if fdb_path is None:
         fdb_path = c0_path if os.path.isfile(c0_path) else None
+    if not fdb_path or not os.path.isfile(fdb_path):
+        raise FileNotFoundError(f"Configured source dinosaur FDB not found: {fdb_path}")
 
-    used_sids = set()
-    used_gids = set()
-
-    if fdb_path and os.path.isfile(fdb_path):
-        con = sqlite3.connect(f"file:{fdb_path}?mode=ro", uri=True)
+    def explicit_int(value, label):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        if isinstance(value, bool):
+            raise ValueError(f"{label} must be an integer, not a boolean")
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError(f"{label} must be a whole integer; got {value!r}")
+        if isinstance(value, str) and not re.fullmatch(r"[+-]?\d+", value.strip()):
+            raise ValueError(f"{label} must be a whole integer; got {value!r}")
         try:
-            cur = con.cursor()
-            for r in cur.execute("SELECT SpeciesID, GeneticSpeciesID FROM Species").fetchall():
-                if r[0]: used_sids.add(int(r[0]))
-                if r[1]: used_gids.add(int(r[1]))
-        finally:
-            con.close()
+            result = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} must be a whole integer; got {value!r}") from exc
+        if not 1 <= result <= MAX_GENERATED_ID:
+            raise ValueError(f"{label} must be between 1 and {MAX_GENERATED_ID}; got {result}")
+        return result
 
-    for config in species_configs:
-        sid = config.get("species_id")
-        gid = config.get("genetic_id")
-        if sid:
-            try:
-                used_sids.add(int(sid))
-            except (ValueError, TypeError):
-                pass
-        if gid:
-            try:
-                used_gids.add(int(gid))
-            except (ValueError, TypeError):
-                pass
+    floor = explicit_int(floor, "ID floor")
+    con = sqlite3.connect(f"file:{fdb_path}?mode=ro", uri=True)
+    try:
+        source_sids = {int(r[0]) for r in con.execute(
+            "SELECT SpeciesID FROM Species WHERE SpeciesID IS NOT NULL")}
+        source_gids = {int(r[0]) for r in con.execute(
+            "SELECT DISTINCT GeneticSpeciesID FROM Species WHERE GeneticSpeciesID IS NOT NULL")}
+        reservations = []
+        for index, config in enumerate(species_configs):
+            label = config.get("name") or f"species #{index + 1}"
+            sid = explicit_int(config.get("species_id"), f"{label} SpeciesID")
+            gid = explicit_int(config.get("genetic_id"), f"{label} GeneticSpeciesID")
+            members = resolve_family_members(
+                con, config.get("source", ""), label,
+                sid if sid is not None else floor,
+                donor_prefabs=config.get("donor_prefabs"),
+                family_members=config.get("family_members"))
+            reservations.append((config, label, sid, gid,
+                                 tuple(m["offset"] for m in members)))
 
-    for config in species_configs:
-        sid = config.get("species_id")
-        if sid is None or sid == "" or str(sid).strip() == "":
-            candidate = random.randint(floor, 999999)
-            while candidate in used_sids or candidate in RESERVED_SPECIES_IDS:
-                candidate = random.randint(floor, 999999)
-            config["species_id"] = candidate
-            used_sids.add(candidate)
-        else:
-            config["species_id"] = int(sid)
+        used_sids = set(source_sids)
+        used_gids = set(source_gids)
+        for config, label, sid, gid, offsets in reservations:
+            if sid is not None:
+                family_ids = {sid + offset for offset in offsets}
+                invalid = sorted(i for i in family_ids
+                                 if i > MAX_GENERATED_ID or i in RESERVED_SPECIES_IDS)
+                overlap = sorted(family_ids & used_sids)
+                if invalid:
+                    raise ValueError(f"{label} family contains invalid/reserved SpeciesID(s): {invalid}")
+                if overlap:
+                    raise ValueError(f"{label} family SpeciesID range conflicts at {overlap}")
+                config["species_id"] = sid
+                used_sids.update(family_ids)
+            if gid is not None:
+                if gid in used_gids:
+                    raise ValueError(f"{label} GeneticSpeciesID {gid} is already in use")
+                config["genetic_id"] = gid
+                used_gids.add(gid)
 
-        gid = config.get("genetic_id")
-        if gid is None or gid == "" or str(gid).strip() == "":
-            candidate = random.randint(floor, 999999)
-            while candidate in used_gids:
-                candidate = random.randint(floor, 999999)
-            config["genetic_id"] = candidate
-            used_gids.add(candidate)
-        else:
-            config["genetic_id"] = int(gid)
-
-    return species_configs
-
+        for config, label, sid, gid, offsets in reservations:
+            if sid is None:
+                candidate = floor
+                while candidate <= MAX_GENERATED_ID:
+                    family_ids = {candidate + offset for offset in offsets}
+                    if (max(family_ids) <= MAX_GENERATED_ID
+                            and not family_ids & used_sids
+                            and not family_ids & RESERVED_SPECIES_IDS):
+                        break
+                    candidate += 1
+                else:
+                    raise ValueError(f"No complete SpeciesID range is available for {label}")
+                config["species_id"] = candidate
+                used_sids.update(family_ids)
+            if gid is None:
+                candidate = floor
+                while candidate <= MAX_GENERATED_ID and candidate in used_gids:
+                    candidate += 1
+                if candidate > MAX_GENERATED_ID:
+                    raise ValueError(f"No GeneticSpeciesID is available for {label}")
+                config["genetic_id"] = candidate
+                used_gids.add(candidate)
+        return species_configs
+    finally:
+        con.close()

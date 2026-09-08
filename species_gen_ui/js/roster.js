@@ -214,7 +214,8 @@ function loadSpeciesIntoUI(sp) {
     if (preview) {
         if (cat && sp.name) {
             const modName = modProject.mod_name || "MyMod";
-            preview.textContent = `ovldata\\${modName}\\Dinosaurs\\${cat}\\${sp.name}\\Female\\${sp.name}`;
+            const packages = buildCategoryAssetPackages(modName, cat, sp);
+            preview.textContent = packages[generatedFemalePackageName(sp)];
         } else {
             preview.textContent = '—';
         }
@@ -463,5 +464,4 @@ function renderFamilyMemberList(allScannedFamily) {
         };
     }
 }
-
 
