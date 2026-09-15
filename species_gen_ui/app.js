@@ -7,12 +7,29 @@ function logButtonClick(btnId, actionName) {
 }
 
 let pendingGenerationMode = null;
+let pendingGenerationSnapshot = null;
+let generationControlStates = null;
 
 function setGenerationControlsEnabled(enabled) {
-    ['btn-generate', 'btn-build-mod', 'btn-update-existing', 'btn-update-mod'].forEach(id => {
-        const button = document.getElementById(id);
-        if (button) button.disabled = !enabled;
+    if (!document.querySelectorAll) return;
+    if (!enabled) {
+        if (generationControlStates) return;
+        generationControlStates = new Map();
+        document.querySelectorAll('input, select, textarea, button').forEach(control => {
+            generationControlStates.set(control, !!control.disabled);
+            control.disabled = true;
+        });
+        return;
+    }
+    if (!generationControlStates) return;
+    generationControlStates.forEach((wasDisabled, control) => {
+        if (control && control.isConnected !== false) control.disabled = wasDisabled;
     });
+    generationControlStates = null;
+}
+
+function projectMatchesGenerationSnapshot(snapshot, project) {
+    return typeof snapshot === 'string' && JSON.stringify(project) === snapshot;
 }
 
 function adoptNormalizedProject(project) {
@@ -25,8 +42,10 @@ function adoptNormalizedProject(project) {
 }
 
 function handleGenerationFinished(resStr) {
+    const requestSnapshot = pendingGenerationSnapshot;
     setGenerationControlsEnabled(true);
     pendingGenerationMode = null;
+    pendingGenerationSnapshot = null;
     try {
         const res = JSON.parse(resStr);
         const mode = res.request_type || 'generate';
@@ -39,23 +58,33 @@ function handleGenerationFinished(resStr) {
             backend.log_activity('ERROR', 'BUILD', `Failed to ${mode} mod: ${res.error}`);
             return;
         }
-        adoptNormalizedProject(res.project);
+        const resultModName = (res.project && res.project.mod_name) || modProject.mod_name;
+        const canAdopt = projectMatchesGenerationSnapshot(requestSnapshot, modProject);
+        if (canAdopt) adoptNormalizedProject(res.project);
         if (mode === 'update') {
-            renderAssetPackages();
-            renderIconList();
-            if (box) box.textContent = `Updated mod files for '${modProject.mod_name}' successfully!`;
-            backend.show_info(`Updated existing files for '${modProject.mod_name}'!`);
+            if (canAdopt) {
+                renderAssetPackages();
+                renderIconList();
+            }
+            if (box) {
+                box.textContent = `Updated mod files for '${resultModName}' successfully!` +
+                    (canAdopt ? '' : '\n\nNewer project edits were retained in the UI.');
+            }
+            backend.show_info(`Updated existing files for '${resultModName}'!`);
         } else {
-            let output = `=== MOD GENERATED SUCCESSFULLY ===\n\nMod Name: ${modProject.mod_name}\nGenerated Files:\n`;
+            let output = `=== MOD GENERATED SUCCESSFULLY ===\n\nMod Name: ${resultModName}\nGenerated Files:\n`;
             Object.keys(res.paths || {}).forEach(key => output += ` - ${key}: ${res.paths[key]}\n`);
             if (res.report && res.report.warnings && res.report.warnings.length) {
                 output += '\nWarnings:\n';
                 res.report.warnings.forEach(w => output += ` ⚠️ ${w}\n`);
             }
+            if (!canAdopt) {
+                output += '\nThe build completed, but newer project edits were retained in the UI.\n';
+            }
             if (box) box.textContent = output;
-            backend.show_info(`Mod '${modProject.mod_name}' generated successfully!`);
+            backend.show_info(`Mod '${resultModName}' generated successfully!`);
         }
-        backend.log_activity('INFO', 'BUILD', `Successfully ${mode === 'update' ? 'updated' : 'generated'} mod '${modProject.mod_name}'.`);
+        backend.log_activity('INFO', 'BUILD', `Successfully ${mode === 'update' ? 'updated' : 'generated'} mod '${resultModName}'.`);
     } catch (error) {
         backend.show_error('Failed to parse generation response: ' + error.message);
     }
@@ -64,16 +93,19 @@ function handleGenerationFinished(resStr) {
 function startGenerationRequest(jsonStr, mode) {
     if (pendingGenerationMode) return;
     pendingGenerationMode = mode;
+    pendingGenerationSnapshot = jsonStr;
     setGenerationControlsEnabled(false);
     backend.start_generate(jsonStr, mode, (ackStr) => {
         try {
             const ack = JSON.parse(ackStr);
             if (ack.accepted) return;
             pendingGenerationMode = null;
+            pendingGenerationSnapshot = null;
             setGenerationControlsEnabled(true);
             backend.show_error(ack.error || 'Could not start generation.');
         } catch (error) {
             pendingGenerationMode = null;
+            pendingGenerationSnapshot = null;
             setGenerationControlsEnabled(true);
             backend.show_error('Could not start generation: ' + error.message);
         }
@@ -722,5 +754,7 @@ if (typeof module !== 'undefined' && module.exports) {
         mergeGeneratedPrefabsIntoProject,
         generatedFemalePackageName,
         buildCategoryAssetPackages,
+        projectMatchesGenerationSnapshot,
+        setGenerationControlsEnabled,
     };
 }

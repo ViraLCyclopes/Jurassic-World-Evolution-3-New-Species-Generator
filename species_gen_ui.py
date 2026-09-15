@@ -148,9 +148,6 @@ class SpeciesGenBackend(QObject):
             if not mod_name or not species_configs:
                 return json.dumps({"success": False, "error": "mod_name and at least one species are required"})
 
-            source_fdb = payload.get("source_dinosaurs_fdb") or species_gen.DEFAULT_SOURCE_FDB
-            species_gen.allocate_species_ids(species_configs, source_fdb)
-
             plans = []
 
             combined_report = {"warnings": [], "tables": {}, "exp_tables": {}}

@@ -27,6 +27,20 @@ LOC_LANGUAGES = [
 BASE_LOCS_DIR = os.path.join(BASE_DIR, "Base Dinosaur Locs")
 
 
+def _long_path(path):
+    """On Windows, prefix with ``\\\\?\\`` to bypass the 260-char MAX_PATH limit.
+
+    Without this, deeply nested install locations (e.g. a double-nested
+    Downloads zip extraction) combined with the Localised hierarchy and
+    long template filenames can exceed 260 characters, causing Python to
+    raise ``FileNotFoundError: [Errno 2]`` even though the parent
+    directory exists.
+    """
+    if os.name == "nt" and not path.startswith("\\\\?\\"):
+        return "\\\\?\\" + os.path.abspath(path)
+    return path
+
+
 def generate_species_localizations(out_dir, species_name, report=None):
     """Generate species loc text files across all 14 language subfolders using Base Dinosaur Locs templates."""
     if not os.path.exists(BASE_LOCS_DIR):
@@ -47,11 +61,11 @@ def generate_species_localizations(out_dir, species_name, report=None):
 
     for lang, country in LOC_LANGUAGES:
         target_dir = os.path.join(localised_root, lang, country)
-        os.makedirs(target_dir, exist_ok=True)
+        os.makedirs(_long_path(target_dir), exist_ok=True)
 
         if lang == "English" and country == "UnitedStates":
             loc_dir = os.path.join(target_dir, "Loc")
-            os.makedirs(loc_dir, exist_ok=True)
+            os.makedirs(_long_path(loc_dir), exist_ok=True)
 
             for template_name in template_files:
                 target_filename = template_name.replace("titanosaurusviral", sp_lower)
@@ -61,7 +75,7 @@ def generate_species_localizations(out_dir, species_name, report=None):
                 with open(src_path, "r", encoding="utf-8", errors="ignore") as f_in:
                     raw_content = f_in.read()
 
-                with open(dst_path, "w", encoding="utf-8") as f_out:
+                with open(_long_path(dst_path), "w", encoding="utf-8") as f_out:
                     f_out.write(raw_content)
 
                 written.append(os.path.relpath(dst_path, out_dir))

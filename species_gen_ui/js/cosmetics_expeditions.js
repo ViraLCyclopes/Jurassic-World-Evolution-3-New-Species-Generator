@@ -10,6 +10,11 @@ function modPathForSelect(mod, selectId) {
     return selectId === 'exp-mod' ? mod.exp_fdb : (mod.dino_fdb || mod.fdb);
 }
 
+function selectHasOptionValue(select, value) {
+    const options = select.options || select.querySelectorAll('option');
+    return Array.from(options || []).some(option => option.value === value);
+}
+
 function refreshBuiltMods() {
     backend.list_built_mods((resStr) => {
         const res = JSON.parse(resStr);
@@ -53,7 +58,7 @@ function refreshBuiltMods() {
                 sel.appendChild(o);
             });
 
-            if (prev !== "" && prev !== null && sel.querySelector(`option[value="${prev}"]`)) {
+            if (prev !== "" && prev !== null && selectHasOptionValue(sel, prev)) {
                 sel.value = prev;
             } else {
                 sel.value = '';
@@ -563,6 +568,7 @@ if (typeof module !== 'undefined' && module.exports) {
         selectedMod,
         deleteEditorRow,
         escapeEditorHtml,
+        selectHasOptionValue,
         _setBuiltMods: value => { builtMods = value; },
         _setEditorTable: value => { editorTable = value; },
         _setExpEditorTable: value => { expEditorTable = value; },

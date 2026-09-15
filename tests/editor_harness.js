@@ -96,6 +96,12 @@ editor._setBuiltMods([
 ]);
 assert.strictEqual(editor.selectedMod('editor-mod').name, 'B');
 assert.strictEqual(editor.escapeEditorHtml('&<\"\'>'), '&amp;&lt;&quot;&#39;&gt;');
+assert.strictEqual(editor.selectHasOptionValue({options: [
+    {value: 'D:\\Generated\\One\\Main\\one.fdb'},
+]}, 'D:\\Generated\\One\\Main\\one.fdb'), true);
+assert.strictEqual(editor.selectHasOptionValue({options: [
+    {value: 'D:\\Generated\\One\\Main\\one.fdb'},
+]}, 'D:\\Generated\\Two\\Main\\two.fdb'), false);
 
 // Loading JSON can merge supported manual prefab edits back into project state.
 global.modProject = {species: [
@@ -120,5 +126,18 @@ assert.deepStrictEqual(categoryPackages, {
 assert.strictEqual(app.generatedFemalePackageName({
     name: 'Rex', source: 'IndominusRex',
 }), 'Rex');
+assert.strictEqual(app.projectMatchesGenerationSnapshot(
+    JSON.stringify({mod_name: 'Original'}), {mod_name: 'Original'}), true);
+assert.strictEqual(app.projectMatchesGenerationSnapshot(
+    JSON.stringify({mod_name: 'Original'}), {mod_name: 'NewerEdit'}), false);
+const enabledControl = {disabled: false};
+const alreadyDisabledControl = {disabled: true};
+document.querySelectorAll = () => [enabledControl, alreadyDisabledControl];
+app.setGenerationControlsEnabled(false);
+assert.strictEqual(enabledControl.disabled, true);
+assert.strictEqual(alreadyDisabledControl.disabled, true);
+app.setGenerationControlsEnabled(true);
+assert.strictEqual(enabledControl.disabled, false);
+assert.strictEqual(alreadyDisabledControl.disabled, true);
 
 console.log('editor harness: ok');
