@@ -571,6 +571,44 @@ class PublicationRegressionTests(unittest.TestCase):
         app.processEvents()
         self.assertEqual("update", received[0]["request_type"])
 
+    def test_auto_allocate_random_base_and_sequential_families(self):
+        configs = [
+            {"source": "Dimetrodon", "name": "RandOne"},
+            {"source": "Dimetrodon", "name": "RandTwo"},
+        ]
+        database.allocate_species_ids(configs, DINO)
+        base1 = configs[0]["species_id"]
+        base2 = configs[1]["species_id"]
+        self.assertGreaterEqual(base1, 1_000_000)
+        self.assertNotEqual(3000, base1)
+        self.assertEqual(base1 + 3, base2)
+        self.assertEqual(base1, configs[0]["genetic_id"])
+        self.assertEqual(base2, configs[1]["genetic_id"])
+
+    def test_dimorphodon_family_member_female_prefab_resolution(self):
+        with tempfile.TemporaryDirectory() as root:
+            payload = {
+                "mod_name": "DimorphTest",
+                "_output_root": root,
+                "species": [
+                    {
+                        "name": "Anurognathus",
+                        "source": "Dimorphodon",
+                        "family_members": [
+                            {"SpeciesID": 139, "Name": "Dimorphodon_Male", "Prefab": "Dimorphodon_Male"},
+                            {"SpeciesID": 322, "Name": "Dimorphodon", "Prefab": "Dimorphodon_Female"},
+                            {"SpeciesID": 384, "Name": "Dimorphodon_Juvenile", "Prefab": "Dimorphodon_Juvenile"}
+                        ]
+                    }
+                ]
+            }
+            plans = []
+            for sp_conf in payload["species"]:
+                plan, _ = generator.plan_species(sp_conf)
+                plans.append({"config": sp_conf, **plan})
+            paths = generator.generate_species("DimorphTest", plans, {"warnings": []}, payload)
+            self.assertTrue(os.path.isfile(paths["dinosaurs_fdb"]))
+
 
 if __name__ == "__main__":
     unittest.main()

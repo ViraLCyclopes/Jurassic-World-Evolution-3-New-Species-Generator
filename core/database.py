@@ -2,6 +2,7 @@ import os
 import sqlite3
 import json
 import re
+import random
 
 from core.templates import (
     DEFAULT_SPECIES_STATS, DEFAULT_GENOMES, DEFAULT_SPECIALISATION,
@@ -265,7 +266,7 @@ def resolve_family_members(con_src, donor_species, new_species, new_species_id,
                 m_pref = m.get("Prefab") or m.get("prefab") or m_name
             else:
                 m_name = m_pref = str(m)
-            donor_fem_pref = donor_prefabs.get("Female") or src_name_actual
+            donor_fem_pref = donor_prefabs.get("Female") or m_pref or src_name_actual
             has_fem_suffix = donor_fem_pref.lower().endswith("_female")
             if m_name in (src_name_actual, base_prefix, f"{base_prefix}_Female"):
                 tgt_name = new_species
@@ -1272,7 +1273,7 @@ def list_generated_mods():
 
 
 
-def allocate_species_ids(species_configs, fdb_path=None, floor=DEFAULT_ID_FLOOR,
+def allocate_species_ids(species_configs, fdb_path=None, floor=None,
                          reserved_species_ids=None, reserved_genetic_ids=None):
     """Validate and allocate complete, non-overlapping generated families."""
     c0_path = os.path.join(BASE_DIR, "extracted_fdbs", "c0dinosaurs.fdb")
@@ -1298,7 +1299,8 @@ def allocate_species_ids(species_configs, fdb_path=None, floor=DEFAULT_ID_FLOOR,
             raise ValueError(f"{label} must be between 1 and {MAX_GENERATED_ID}; got {result}")
         return result
 
-    floor = explicit_int(floor, "ID floor")
+    if floor is not None:
+        floor = explicit_int(floor, "ID floor")
     con = sqlite3.connect(f"file:{fdb_path}?mode=ro", uri=True)
     try:
         source_sids = {int(r[0]) for r in con.execute(
@@ -1312,7 +1314,7 @@ def allocate_species_ids(species_configs, fdb_path=None, floor=DEFAULT_ID_FLOOR,
             gid = explicit_int(config.get("genetic_id"), f"{label} GeneticSpeciesID")
             members = resolve_family_members(
                 con, config.get("source", ""), label,
-                sid if sid is not None else floor,
+                sid if sid is not None else (floor or 1),
                 donor_prefabs=config.get("donor_prefabs"),
                 family_members=config.get("family_members"))
             reservations.append((config, label, sid, gid,
@@ -1340,9 +1342,14 @@ def allocate_species_ids(species_configs, fdb_path=None, floor=DEFAULT_ID_FLOOR,
                 config["genetic_id"] = gid
                 used_gids.add(gid)
 
+        if floor is not None:
+            current_candidate = floor
+        else:
+            current_candidate = random.randint(1_000_000, 90_000_000)
+
         for config, label, sid, gid, offsets in reservations:
             if sid is None:
-                candidate = floor
+                candidate = current_candidate
                 while candidate <= MAX_GENERATED_ID:
                     family_ids = {candidate + offset for offset in offsets}
                     if (max(family_ids) <= MAX_GENERATED_ID
@@ -1354,8 +1361,9 @@ def allocate_species_ids(species_configs, fdb_path=None, floor=DEFAULT_ID_FLOOR,
                     raise ValueError(f"No complete SpeciesID range is available for {label}")
                 config["species_id"] = candidate
                 used_sids.update(family_ids)
+                current_candidate = max(family_ids) + 1
             if gid is None:
-                candidate = floor
+                candidate = config["species_id"]
                 while candidate <= MAX_GENERATED_ID and candidate in used_gids:
                     candidate += 1
                 if candidate > MAX_GENERATED_ID:
