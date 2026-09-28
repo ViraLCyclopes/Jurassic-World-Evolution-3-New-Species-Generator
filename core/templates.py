@@ -399,10 +399,19 @@ end
 #
 # Every ui2 call is pcall-wrapped: a missing overlay must degrade to "no custom
 # icons", never take the game down.
+#
+# The mount MUST be paired with a release. An overlay left mapped at process exit
+# crashes the game on shutdown, so the manager hooks
+# Game.GameScript.OnPrepareToShutdown and runs the vanilla
+# UnmapResources -> AreResourcesUnmapped -> UnloadOverlay sequence there. See the
+# comment on that hook at the bottom of the template for why it cannot be a
+# manager PrepareToShutdown/Shutdown method.
 ICON_MOUNT_LUA = '''local global = _G
 local api = global.api
 local pcall = global.pcall
 local ipairs = global.ipairs
+local type = global.type
+local coroutine = global.coroutine
 local require = global.require
 local Mutators = require("Environment.ModuleMutators")
 
@@ -420,6 +429,7 @@ local c_sBaseOverlay = "UserInterfaceImagesC0"
 {mod_name}IconMount.Init = function(self, _tProperties, _tEnvironment)
     self.bLoadReq = false
     self.bMapped = false
+    self:_InstallShutdownHook()
 end
 
 {mod_name}IconMount._Mount = function(self)
@@ -477,6 +487,74 @@ end
 {mod_name}IconMount.Advance = function(self, _dt, _udt)
     if global.__b{mod_name}IconsMapped then return end
     self:_Mount()
+end
+
+-- Shutdown release. A ui2 overlay that is mapped and never released crashes the
+-- game on exit, so mirror Game.GameScript.OnPrepareToShutdown (GameMain\\Main.ovl),
+-- which pairs every LoadOverlay/MapResources with
+-- UnmapResources -> wait on AreResourcesUnmapped -> UnloadOverlay.
+--
+-- Why a Game.GameScript hook and not a manager method: Environment:PrepareToShutdown
+-- is only ever reached from BaseGame:PrepareToShutdown, the process shutdown path.
+-- Leaving a world instead runs World:Shutdown -> Environment:Shutdown, which skips
+-- PrepareToShutdown entirely. A manager method would therefore either never fire at
+-- all or fire on a world transition and unmap the icons mid-session.
+-- BaseGame:PrepareToShutdown yields before it dispatches, so this hook runs inside a
+-- coroutine and coroutine.yield() is legal here.
+local c_nUnmapWaitTicks = 600
+
+-- Takes no self on purpose: it runs from the GameScript hook at process shutdown,
+-- by which point the manager instance that installed it may be gone. The overlay
+-- list and the _G flag are the only state it needs.
+{mod_name}IconMount._Release = function()
+    if not global.__b{mod_name}IconsMapped then return end
+    local ui2 = api.ui2
+    if not ui2 then return end
+
+    for _, t in ipairs(c_tOverlays) do
+        pcall(function() ui2.UnmapResources(t[1]) end)
+    end
+
+    -- Vanilla can wait forever because it knows its own overlays are mapped; a mod
+    -- must never be able to hang the game on exit, so the wait is capped and a
+    -- still-mapped overlay is left alone rather than unloaded underneath the engine.
+    local bAllReleased = true
+    for _, t in ipairs(c_tOverlays) do
+        local nWait = c_nUnmapWaitTicks
+        local bUnmapped = false
+        while true do
+            pcall(function() bUnmapped = ui2.AreResourcesUnmapped(t[1]) == true end)
+            if bUnmapped then break end
+            nWait = nWait - 1
+            if nWait <= 0 then break end
+            coroutine.yield()
+        end
+        if bUnmapped then
+            pcall(function() ui2.UnloadOverlay(t[1]) end)
+        else
+            bAllReleased = false
+            api.debug.Trace("{mod_name}: " .. t[1] .. " still mapped after wait, skipping UnloadOverlay")
+        end
+    end
+
+    if bAllReleased then
+        global.__b{mod_name}IconsMapped = false
+    end
+end
+
+{mod_name}IconMount._InstallShutdownHook = function(self)
+    if global.__b{mod_name}IconUnmapHooked then return end
+    local GameScript = nil
+    pcall(function() GameScript = require("Game.GameScript") end)
+    if type(GameScript) ~= "table" then return end
+    global.__b{mod_name}IconUnmapHooked = true
+
+    -- Call the original first so vanilla releases its own overlays, then ours.
+    local fnPrev = GameScript.OnPrepareToShutdown
+    GameScript.OnPrepareToShutdown = function(_self)
+        if fnPrev then fnPrev(_self) end
+        {mod_name}IconMount._Release()
+    end
 end
 
 -- ACSE managers must end with this, NOT `return`. Without it the manager
