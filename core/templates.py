@@ -16,12 +16,12 @@ DEFAULT_ID_FLOOR = 3000
 # FDB Table Sets
 COSMETIC_TABLES = [
     "SpeciesCosmeticVariants", "SpeciesCosmeticPatterns",
-    "SpeciesCosmeticSets", "SpeciesCosmetics"
+    "SpeciesCosmeticSets"
 ]
 
 SPECIES_TABLES = [
-    "Species", "GeneticSpecies", "SpeciesStats", "Genome",
-    "SpeciesCosmeticSets", "SpeciesCosmetics",
+    "Species", "GeneticSpecies", "SpeciesStats",
+    "SpeciesCosmeticSets",
     "SpeciesCosmeticVariants", "SpeciesCosmeticPatterns"
 ]
 
