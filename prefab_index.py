@@ -17,6 +17,12 @@ DUMP FORMAT - the traps that make hand-grepping unreliable
   column-0 entry is ENGINE-SIDE. Inheriting it yields a prefab that compiles and
   spawns but inherits nothing - no renderer, invisible, and no error anywhere.
   The index records both sets so callers can tell them apart.
+* KEY ORDER IS NOT STABLE. Up to 1.5.2 the dumper wrote `Prefab =` first; the
+  1.5.5 dump writes it anywhere (often last), keeps real key casing, wraps the
+  entries in one extra `{ }` group and repeats ~850 entries in a second pass
+  (same table, different key order). So the parent is ONLY the `Prefab =` at
+  the entry's own top level (depth 1) - a nested `Prefab =` inside Components
+  or Properties is not the parent (98 entries were misparented before this).
 
 OUTPUT  (prefab_index.json)
 ---------------------------
@@ -111,7 +117,7 @@ def build(dump_path=DUMP):
                 continue
 
             m = PARENT_RE.match(line)
-            if m and cur["parent"] is None:
+            if m and depth == 1 and cur["parent"] is None:
                 cur["parent"] = m.group(1)
                 parents_seen.add(m.group(1).lower())
                 continue
