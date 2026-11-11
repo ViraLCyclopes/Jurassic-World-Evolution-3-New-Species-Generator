@@ -529,6 +529,33 @@ def _asset_packages_block(prefab_name, override, mode, indent=8):
     return "\n".join(lines)
 
 
+_PREFAB_INDEX_CACHE = {}
+
+
+def _donor_cosmetic_sets(donor_prefab, cosmetic_name, index_path=None):
+    """(MaterialPatternsName, MaterialVariantsName) of the donor's matching _NN
+    cosmetic, read from prefab_index.json; falls back to the donor prefab's own
+    values.  None when the index has neither."""
+    index_path = index_path or os.path.join(BASE_DIR, "prefab_index.json")
+    if index_path not in _PREFAB_INDEX_CACHE:
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _PREFAB_INDEX_CACHE[index_path] = data.get("entries", data)
+        except (OSError, ValueError):
+            _PREFAB_INDEX_CACHE[index_path] = {}
+    entries = _PREFAB_INDEX_CACHE[index_path]
+    m = re.search(r"_(\d+)$", cosmetic_name or "")
+    candidates = [f"{donor_prefab}_{m.group(1)}"] if m else []
+    candidates.append(donor_prefab)
+    for key in candidates:
+        props = (entries.get(key.lower()) or {}).get("props") or {}
+        pattern, variant = props.get("MaterialPatternsName"), props.get("MaterialVariantsName")
+        if pattern and variant:
+            return pattern, variant
+    return None
+
+
 def _replace_lua_table(src, var_name, body):
     """Swap the contents of `<var> = { ... }` for a generated body."""
     pat = re.compile(re.escape(var_name) + r"\s*=\s*\{.*?\n\}", re.S)
@@ -794,6 +821,7 @@ def write_scaffold(out_dir, mod_name, plans, config, report):
         members = plan["members"]
         cosmetic_plan = plan.get("cosmetic_plan", [])
         prefab_overrides = plan["config"].get("prefab_overrides", {})
+        member_meta = {}
 
         # Prefab Luas
         for prefab_name, default_donor in members:
@@ -836,14 +864,35 @@ def write_scaffold(out_dir, mod_name, plans, config, report):
                                         donor=donor or "", properties=props_str))
             written.append(os.path.basename(path))
             all_prefab_names.append(prefab_name)
+            member_meta[prefab_name] = {"donor": donor, "ap_mode": ap_mode}
 
         # Cosmetic variant Luas
         for cosm in cosmetic_plan:
+            pattern_set, variant_set = cosm["pattern_set"], cosm["variant_set"]
+            meta = member_meta.get(cosm["parent"]) or {}
+            if meta.get("ap_mode") == "Inherit" and meta.get("donor"):
+                # An 'Inherit' member loads ONLY the donor's packages, so the
+                # new species' <Name>_PatternSet_NN cannot resolve for it - those
+                # sets live in a package this member never mounts.  Point its
+                # colour prefab at the donor's own sets instead, until its own
+                # art (and package) exists.
+                donor_sets = _donor_cosmetic_sets(meta["donor"], cosm["name"])
+                if donor_sets:
+                    pattern_set, variant_set = donor_sets
+                    report.setdefault("cosmetic_sets_from_donor", []).append(
+                        {"prefab": cosm["name"], "pattern_set": pattern_set,
+                         "variant_set": variant_set})
+                else:
+                    report.setdefault("warnings", []).append(
+                        f"{cosm['name']}: parent rides on the donor's packages "
+                        f"(Inherit) but no donor cosmetic sets were found for "
+                        f"{meta['donor']}; it references {pattern_set}, which only "
+                        f"resolves once this member ships its own package.")
             path = os.path.join(main_dir, f"{cosm['name'].lower()}.lua")
             _write_generated_lua(path, COSMETIC_LUA.format(
                 mod=cosm["name"], name=cosm["name"],
-                parent=cosm["parent"], pattern_set=cosm["pattern_set"],
-                variant_set=cosm["variant_set"],
+                parent=cosm["parent"], pattern_set=pattern_set,
+                variant_set=variant_set,
             ))
             written.append(os.path.basename(path))
             all_prefab_names.append(cosm["name"])

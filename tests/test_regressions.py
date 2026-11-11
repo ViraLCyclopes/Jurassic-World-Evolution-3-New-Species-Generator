@@ -609,6 +609,56 @@ class PublicationRegressionTests(unittest.TestCase):
             paths = generator.generate_species("DimorphTest", plans, {"warnings": []}, payload)
             self.assertTrue(os.path.isfile(paths["dinosaurs_fdb"]))
 
+    def test_inherit_member_cosmetics_use_donor_sets(self):
+        """A member left on the donor's packages ('Inherit') cannot resolve the
+        new species' <Name>_PatternSet_NN, so its _NN stub must name the donor's
+        own sets; members with their own package keep the new names."""
+        with tempfile.TemporaryDirectory() as root:
+            species = {
+                "name": "InheritTest",
+                "source": "Minmi",
+                "family_members": [
+                    {"SpeciesID": 334, "Name": "Minmi", "Prefab": "Minmi_Female"},
+                    {"SpeciesID": 1334, "Name": "Minmi_Male", "Prefab": "Minmi_Male"},
+                    {"SpeciesID": 2334, "Name": "Minmi_Juvenile", "Prefab": "Minmi_Juvenile"},
+                ],
+                "prefab_overrides": {
+                    "Male": {"AssetPackageInheritance": "Inherit"},
+                    "Juvenile": {"AssetPackageInheritance": "Inherit"},
+                },
+            }
+            payload = {"mod_name": "InheritTest", "_output_root": root, "species": [species]}
+            plan, _ = generator.plan_species(species)
+            report = {"warnings": []}
+            paths = generator.generate_species(
+                "InheritTest", [{"config": species, **plan}], report, payload)
+            main = os.path.join(paths["output_dir"], "Main")
+
+            def read(name):
+                with open(os.path.join(main, name), encoding="utf-8") as f:
+                    return f.read()
+
+            self.assertIn("Minmi_Male_PatternSet_01", read("inherittest_male_01.lua"))
+            self.assertIn("Minmi_Male_VariantSet_01", read("inherittest_male_01.lua"))
+            self.assertIn("Minmi_Juvenile_PatternSet_01", read("inherittest_juvenile_01.lua"))
+            self.assertIn("InheritTest_PatternSet_01", read("inherittest_female_01.lua"))
+            self.assertNotIn("AssetPackages", read("inherittest_male.lua"))
+            self.assertIn("'InheritTest_Female'", read("inherittest_female.lua"))
+
+    def test_donor_cosmetic_sets_fallback_and_miss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = os.path.join(tmp, "prefab_index.json")
+            with open(index, "w", encoding="utf-8") as f:
+                json.dump({"entries": {
+                    "donor_juvenile": {"props": {"MaterialPatternsName": "P",
+                                                 "MaterialVariantsName": "V"}},
+                }}, f)
+            # no donor_juvenile_02 entry -> falls back to the donor prefab's own sets
+            self.assertEqual(("P", "V"), generator._donor_cosmetic_sets(
+                "Donor_Juvenile", "New_Juvenile_02", index_path=index))
+            self.assertIsNone(generator._donor_cosmetic_sets(
+                "Unknown", "New_01", index_path=index))
+
 
 if __name__ == "__main__":
     unittest.main()
